@@ -14,6 +14,7 @@ make_transitions.py — расставляет переходы по патте�
 """
 import argparse
 import json
+import math
 import sys
 import uuid
 from pathlib import Path
@@ -49,13 +50,25 @@ def load_transition_pattern() -> tuple[dict[str, int], list[str]]:
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
             if isinstance(cfg.get("durations_sec"), dict) and cfg["durations_sec"]:
-                parsed = {str(k): int(float(v) * 1_000_000) for k, v in cfg["durations_sec"].items() if float(v) > 0}
+                parsed = {}
+                for k, v in cfg["durations_sec"].items():
+                    if isinstance(v, bool):
+                        continue
+                    sec = float(v)
+                    if not math.isfinite(sec):
+                        continue
+                    dur_us = round(sec * 1_000_000)
+                    if dur_us > 0:
+                        parsed[str(k)] = dur_us
                 if parsed:
                     durations = parsed
             if isinstance(cfg.get("pattern"), list) and cfg["pattern"]:
                 pattern = [str(x) for x in cfg["pattern"] if str(x) in durations]
+            else:
+                pattern = [x for x in pattern if x in durations]
         except Exception as exc:
             print(f"[!] Ошибка чтения transitions_config.json ({exc}), использую настройки по умолчанию.")
+    pattern = [x for x in pattern if x in durations]
     return durations, pattern or list(durations.keys())
 
 

@@ -11,6 +11,7 @@ gui.py — оконный запуск make_transitions.py, clear_vids.py и sto
 Для YouTube в stock_fetcher.py нужен: pip install yt-dlp
 """
 import json
+import math
 import os
 import queue
 import shlex
@@ -30,7 +31,12 @@ from capcut_common import (
     find_draft_file,
     restore_latest_backup,
 )
-import clear_vids
+try:
+    import clear_vids
+    _CLEAR_VIDS_ERR = None
+except ImportError as exc:
+    clear_vids = None
+    _CLEAR_VIDS_ERR = exc
 import make_transitions
 import stock_fetcher
 
@@ -233,7 +239,7 @@ class App(tk.Tk):
         fields = [
             ("Порог (среднее)", self.c_thr, "0.46 / 0.50"),
             ("Порог (кадр)", self.c_thr_single, "0.70"),
-            ("Дорожка №", self.c_track, "авто"),
+            ("Дорожка №", self.c_track, "0"),
             ("Только размер", self.c_size, "1280x720"),
             ("Кадры, сек", self.c_probe, "0.1 0.5 1.0 …"),
             ("Свои флаги", self.c_extra, "--marks …"),
@@ -488,7 +494,9 @@ class App(tk.Tk):
 
     def open_transitions_editor(self):
         durations, pattern = make_transitions.load_transition_pattern()
-        all_ids = list(dict.fromkeys(list(pattern) + list(make_transitions.DEFAULT_DURATIONS_MAP.keys())))
+        all_ids = list(dict.fromkeys(
+            list(pattern) + list(durations.keys()) + list(make_transitions.DEFAULT_DURATIONS_MAP.keys())
+        ))
         names = {k: v["name"] for k, v in make_transitions.FALLBACK_TEMPLATES.items()}
 
         win = tk.Toplevel(self)
@@ -508,7 +516,7 @@ class App(tk.Tk):
         for eid in all_ids:
             enabled = tk.BooleanVar(value=eid in pattern)
             dur_val = durations.get(eid, make_transitions.DEFAULT_DURATIONS_MAP.get(eid, 1_000_000)) / 1_000_000
-            dur_var = tk.StringVar(value=f"{dur_val:.2f}".rstrip("0").rstrip("."))
+            dur_var = tk.StringVar(value=f"{dur_val:.3f}".rstrip("0").rstrip("."))
             rows.append([eid, enabled, dur_var])
 
         def redraw():
@@ -543,7 +551,7 @@ class App(tk.Tk):
             try:
                 for eid, en_var, dur_var in rows:
                     sec = float(dur_var.get().strip().replace(",", "."))
-                    if sec <= 0:
+                    if not math.isfinite(sec) or round(sec, 3) <= 0:
                         raise ValueError("Длительность должна быть > 0")
                     new_durs[eid] = round(sec, 3)
                     if en_var.get():
@@ -624,13 +632,15 @@ class App(tk.Tk):
             cmd = self._base_worker_cmd("stock", SCRIPT_STOCK) + [mode, target, "-o", out_dir]
             if mode == "yt":
                 dur = self.s_duration.get().strip() or "30"
-                int(dur)
+                if int(dur) <= 0:
+                    raise ValueError("Длительность фрагмента должна быть > 0")
                 cmd += ["-d", dur]
                 if self.s_full.get():
                     cmd.append("--full")
             else:
                 cnt = self.s_count.get().strip() or "3"
-                int(cnt)
+                if int(cnt) <= 0:
+                    raise ValueError("Количество видео должно быть > 0")
                 cmd += ["-n", cnt]
                 if mode == "batch-tags":
                     cmd += ["--service", self.s_batch_srv.get()]
@@ -647,7 +657,8 @@ class App(tk.Tk):
         cmd = self._base_worker_cmd("clear", SCRIPT_CLEAR) + [str(project)]
         scale = self.c_scale.get().strip().replace(",", ".")
         if scale:
-            float(scale)
+            if float(scale) <= 0:
+                raise ValueError("Масштаб должен быть > 0")
             cmd += ["--scale", scale]
         if self.c_dry.get():
             cmd.append("--dry-run")
@@ -713,7 +724,7 @@ class App(tk.Tk):
         threading.Thread(target=self.worker, args=(cmds,), daemon=True).start()
 
     def worker(self, cmds):
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
         flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
         ok_all = True
         titles = {"clear": "Масштаб + вотермарка", "trans": "Переходы", "stock": "Скачивание видео"}
@@ -746,6 +757,17 @@ class App(tk.Tk):
     def stop(self):
         if self.proc and self.proc.poll() is None:
             self.stop_flag = True
+            if IS_WIN:
+                try:
+                    subprocess.Popen(
+                        ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    return
+                except Exception:
+                    pass
             self.proc.terminate()
 
     def poll_queue(self):
@@ -813,9 +835,17 @@ class App(tk.Tk):
 def _dispatch_worker() -> bool:
     """Точка входа для дочерних процессов при запуске собранного .exe."""
     if len(sys.argv) >= 3 and sys.argv[1] == "--run-worker":
+        for stream in (sys.stdout, sys.stderr):
+            if stream and hasattr(stream, "reconfigure"):
+                try:
+                    stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+                except Exception:
+                    pass
         kind = sys.argv[2]
         sys.argv = [sys.argv[0]] + sys.argv[3:]
         if kind == "clear":
+            if clear_vids is None:
+                sys.exit(f"Не удалось загрузить clear_vids: {_CLEAR_VIDS_ERR}")
             clear_vids.main()
         elif kind == "trans":
             make_transitions.main()

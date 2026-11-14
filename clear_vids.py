@@ -185,12 +185,18 @@ def detect_watermark(mat, seg, marks, stack_thr, single_thr, margin, probe_times
 
     start = src["start"] / 1e6
     dur = src["duration"] / 1e6
-    if dur > 0 and len(probe_times) > 1 and dur < max(probe_times):
+    if not probe_times:
+        eff_probes = [0.0]
+    elif dur > 0 and len(probe_times) > 1 and dur < max(probe_times):
         # Для коротких клипов равномерно распределяем кадры по длине сегмента
         n_pts = min(len(probe_times), max(3, int(round(dur * 5))))
         eff_probes = [dur * (0.05 + 0.85 * idx / (n_pts - 1)) for idx in range(n_pts)]
     else:
-        eff_probes = [min(pt, dur * 0.5) if dur > 0 else pt for pt in probe_times if pt == probe_times[0] or pt <= dur * 0.95]
+        eff_probes = [
+            min(pt, dur * 0.95) if dur > 0 else 0.0
+            for i, pt in enumerate(probe_times)
+            if i == 0 or pt <= dur * 0.95
+        ]
 
     frames = []
     for pt in eff_probes:
@@ -308,7 +314,8 @@ def main():
                 "или запусти с --force."
             )
         draft = load_draft(draft_path)
-        idx, track = pick_main_track(draft["tracks"], args.track)
+        track_idx = 0 if args.track is None else args.track
+        idx, track = pick_main_track(draft["tracks"], track_idx)
     except DraftError as e:
         sys.exit(f"Ошибка: {e}")
 
@@ -322,7 +329,13 @@ def main():
 
     want_size = None
     if args.size:
-        want_size = tuple(int(v) for v in args.size.lower().split("x"))
+        try:
+            parts = [int(v) for v in args.size.lower().split("x")]
+            if len(parts) != 2 or parts[0] <= 0 or parts[1] <= 0:
+                raise ValueError
+            want_size = (parts[0], parts[1])
+        except ValueError:
+            sys.exit(f"--size: неверный формат '{args.size}', ожидается ШИРИНАxВЫСОТА, напр. 1280x720")
 
     cache = {}
     n_wm = n_clean = n_skip = n_err = 0

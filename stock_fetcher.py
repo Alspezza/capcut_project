@@ -100,6 +100,7 @@ def parse_youtube_timestamp(url: str) -> int | None:
 
 def download_file_stream(url: str, dest_path: Path, headers: dict | None = None) -> bool:
     """Скачивает файл через urllib с отображением прогресса (совместимо с GUI и терминалом)."""
+    part_path = dest_path.with_name(dest_path.name + ".part")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -107,7 +108,7 @@ def download_file_stream(url: str, dest_path: Path, headers: dict | None = None)
             req_headers.update(headers)
 
         req = urllib.request.Request(url, headers=req_headers)
-        is_tty = sys.stdout.isatty()
+        is_tty = bool(sys.stdout and sys.stdout.isatty())
         last_step = -1
 
         with urllib.request.urlopen(req, timeout=60) as response:
@@ -117,7 +118,7 @@ def download_file_stream(url: str, dest_path: Path, headers: dict | None = None)
                 total_size = 0
             downloaded = 0
             print(f"[*] Скачивание: {dest_path.name}")
-            with open(dest_path, "wb") as f:
+            with open(part_path, "wb") as f:
                 while True:
                     chunk = response.read(1024 * 512)
                     if not chunk:
@@ -138,12 +139,13 @@ def download_file_stream(url: str, dest_path: Path, headers: dict | None = None)
                                 print(f"    Прогресс: {percent:.0f}% ({mb_done:.1f}/{mb_total:.1f} MB)")
         if is_tty:
             print()
+        part_path.replace(dest_path)
         print(f"Готово: {dest_path}")
         return True
     except Exception as exc:
         print(f"[!] Ошибка при скачивании {url}: {exc}")
-        if dest_path.exists():
-            dest_path.unlink(missing_ok=True)
+        if part_path.exists():
+            part_path.unlink(missing_ok=True)
         return False
 
 
@@ -151,7 +153,8 @@ def http_get_json(url: str, headers: dict | None = None, params: dict | None = N
     """Выполняет GET-запрос и возвращает JSON."""
     try:
         if params:
-            url = f"{url}?{urlencode(params)}"
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}{urlencode(params)}"
         req_headers = {"User-Agent": "Mozilla/5.0"}
         if headers:
             req_headers.update(headers)
@@ -177,9 +180,18 @@ def download_youtube_url(url: str, output_dir: Path, duration: int = 30, full: b
         print("[!] Ошибка: yt-dlp не установлен. Установите: pip install yt-dlp")
         return False
 
+    if duration <= 0 and not full:
+        print("[!] Ошибка: длительность фрагмента должна быть больше 0.")
+        return False
+
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = parse_youtube_timestamp(url)
-    outtmpl = str(output_dir / "%(title).60s [%(id)s].%(ext)s")
+    if timestamp is not None and not full:
+        start_sec = timestamp
+        end_sec = timestamp + duration
+        outtmpl = str(output_dir / f"%(title).60s [%(id)s] [{start_sec}-{end_sec}s].%(ext)s")
+    else:
+        outtmpl = str(output_dir / "%(title).60s [%(id)s].%(ext)s")
 
     ydl_opts = {
         "outtmpl": outtmpl,
@@ -191,8 +203,6 @@ def download_youtube_url(url: str, output_dir: Path, duration: int = 30, full: b
     }
 
     if timestamp is not None and not full:
-        start_sec = timestamp
-        end_sec = timestamp + duration
         print(f"[*] Найден таймкод: t={start_sec}s. Скачиваем фрагмент [{start_sec}s - {end_sec}s] ({duration} сек)")
 
         def download_ranges_callback(info_dict, ydl):
@@ -217,6 +227,8 @@ def download_youtube_url(url: str, output_dir: Path, duration: int = 30, full: b
 # Модуль Pexels Video API
 # ==========================================
 def search_pexels_videos(query: str, count: int = 3) -> list[dict]:
+    if count <= 0:
+        return []
     cfg = load_config()
     api_key = cfg.get("pexels_api_key")
     if not api_key:
@@ -227,21 +239,21 @@ def search_pexels_videos(query: str, count: int = 3) -> list[dict]:
     data = http_get_json(
         "https://api.pexels.com/videos/search",
         headers={"Authorization": api_key},
-        params={"query": query, "per_page": count, "orientation": "landscape"},
+        params={"query": query, "per_page": min(80, count), "orientation": "landscape"},
     )
     if not data:
         return []
 
     videos = []
-    for item in data.get("videos", []):
-        files = [f for f in item.get("video_files", []) if f.get("file_type") == "video/mp4"]
+    for item in data.get("videos", [])[:count]:
+        files = [f for f in item.get("video_files", []) if f.get("file_type") == "video/mp4" and f.get("link")]
         if not files:
             continue
         best_file = max(files, key=lambda x: x.get("width") or 0)
         videos.append({
             "id": item["id"],
-            "width": best_file.get("width"),
-            "height": best_file.get("height"),
+            "width": best_file.get("width") or 0,
+            "height": best_file.get("height") or 0,
             "url": best_file["link"],
         })
     return videos
@@ -274,6 +286,8 @@ def download_pexels(query: str, count: int, output_dir: Path) -> int:
 # Модуль Pixabay Video API
 # ==========================================
 def search_pixabay_videos(query: str, count: int = 3) -> list[dict]:
+    if count <= 0:
+        return []
     cfg = load_config()
     api_key = cfg.get("pixabay_api_key")
     if not api_key:
@@ -281,22 +295,29 @@ def search_pixabay_videos(query: str, count: int = 3) -> list[dict]:
         print("    Получить бесплатный ключ: https://pixabay.com/api/docs/")
         return []
 
+    # Pixabay API требует per_page в диапазоне 3..200; обрезаем до count после ответа.
+    per_page = max(3, min(200, int(count)))
     data = http_get_json(
         "https://pixabay.com/api/videos/",
-        params={"key": api_key, "q": query, "per_page": count, "video_type": "film"},
+        params={"key": api_key, "q": query, "per_page": per_page, "video_type": "film"},
     )
     if not data:
         return []
 
     videos = []
-    for item in data.get("hits", []):
+    for item in data.get("hits", [])[:count]:
         v_types = item.get("videos", {})
-        best_opt = v_types.get("large") or v_types.get("medium") or v_types.get("small")
-        if best_opt and best_opt.get("url"):
+        best_opt = None
+        for quality in ("large", "medium", "small", "tiny"):
+            cand = v_types.get(quality)
+            if isinstance(cand, dict) and cand.get("url"):
+                best_opt = cand
+                break
+        if best_opt:
             videos.append({
                 "id": item["id"],
-                "width": best_opt.get("width"),
-                "height": best_opt.get("height"),
+                "width": best_opt.get("width") or 0,
+                "height": best_opt.get("height") or 0,
                 "url": best_opt["url"],
             })
     return videos
@@ -343,24 +364,26 @@ def parse_tags_file(file_path: Path) -> list[dict]:
     return categories
 
 
-def process_batch_tags(file_path: Path, service: str = "pexels", per_tag_count: int = 1, out_base: Path | None = None):
+def process_batch_tags(file_path: Path, service: str = "pexels", per_tag_count: int = 1, out_base: Path | None = None) -> int:
     if not file_path.exists():
         print(f"[!] Ошибка: файл не найден: {file_path}")
-        return
+        return -1
 
     categories = parse_tags_file(file_path)
     print(f"[*] Найдено категорий: {len(categories)}")
     out_base = out_base or Path(load_config().get("download_dir", "downloads"))
 
+    total_ok = 0
     for cat_idx, cat in enumerate(categories, 1):
         cat_dir = out_base / f"{cat_idx:02d}_{cat['category']}"
         print(f"\n=== Категория [{cat_idx}/{len(categories)}]: {cat['category']} ===")
         print(f"Папка: {cat_dir}")
         for tag in cat["tags"]:
             if service == "pexels":
-                download_pexels(tag, count=per_tag_count, output_dir=cat_dir)
+                total_ok += download_pexels(tag, count=per_tag_count, output_dir=cat_dir)
             elif service == "pixabay":
-                download_pixabay(tag, count=per_tag_count, output_dir=cat_dir)
+                total_ok += download_pixabay(tag, count=per_tag_count, output_dir=cat_dir)
+    return total_ok
 
 
 def main():
@@ -406,23 +429,46 @@ def main():
                 for line in target_path.read_text(encoding="utf-8").splitlines()
                 if line.strip() and not line.startswith("#")
             ]
+            if not urls:
+                print(f"[!] В файле нет ссылок: {target_path}")
+                sys.exit(1)
             print(f"[*] Найдено ссылок в файле: {len(urls)}")
+            ok = 0
             for idx, u in enumerate(urls, 1):
                 print(f"\n--- Ролик {idx}/{len(urls)} ---")
-                download_youtube_url(u, out_path, duration=args.duration, full=args.full)
+                if download_youtube_url(u, out_path, duration=args.duration, full=args.full):
+                    ok += 1
+            if ok == 0:
+                sys.exit(1)
+        elif args.target.lower().endswith(".txt") and not target_path.exists():
+            print(f"[!] Ошибка: файл со ссылками не найден: {args.target}")
+            sys.exit(1)
         else:
-            download_youtube_url(args.target, out_path, duration=args.duration, full=args.full)
+            if not download_youtube_url(args.target, out_path, duration=args.duration, full=args.full):
+                sys.exit(1)
     elif args.command == "pexels":
+        if not load_config().get("pexels_api_key"):
+            print("[!] Ошибка: не указан pexels_api_key (stock_config.json или PEXELS_API_KEY).")
+            sys.exit(1)
         download_pexels(args.query, args.count, Path(args.output))
     elif args.command == "pixabay":
+        if not load_config().get("pixabay_api_key"):
+            print("[!] Ошибка: не указан pixabay_api_key (stock_config.json или PIXABAY_API_KEY).")
+            sys.exit(1)
         download_pixabay(args.query, args.count, Path(args.output))
     elif args.command == "batch-tags":
-        process_batch_tags(
+        key_name = "pexels_api_key" if args.service == "pexels" else "pixabay_api_key"
+        if not load_config().get(key_name):
+            print(f"[!] Ошибка: не указан {key_name} (stock_config.json или env).")
+            sys.exit(1)
+        res = process_batch_tags(
             Path(args.file),
             service=args.service,
             per_tag_count=args.count,
             out_base=Path(args.output),
         )
+        if res < 0:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

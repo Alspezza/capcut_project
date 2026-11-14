@@ -61,14 +61,16 @@ def capcut_is_running() -> bool:
 
 def find_draft_file(project: Path | str) -> Path:
     """Ищет файл таймлайна: сам файл, draft_content.json или Timelines/*/draft_info.json."""
+    if not str(project).strip():
+        raise DraftError("Путь к проекту не указан.")
     p = Path(project)
     if p.is_file():
         return p
     direct = p / "draft_content.json"
-    if direct.exists():
+    if direct.is_file():
         return direct
     timelines = p / "Timelines"
-    if timelines.exists():
+    if timelines.is_dir():
         cands = sorted(timelines.glob("*/draft_info.json"))
         if cands:
             return cands[0]
@@ -92,7 +94,7 @@ def pick_main_track(tracks: list, index: int | None = None) -> tuple[int, dict]:
     Выбирает видеодорожку: по явному индексу или дорожку с наибольшим числом сегментов.
     Возвращает (индекс_среди_видеодорожек, объект_дорожки).
     """
-    video = [t for t in tracks if t.get("type") == "video"]
+    video = [t for t in tracks if isinstance(t, dict) and t.get("type") == "video"]
     if not video:
         raise DraftError("В проекте нет видеодорожек.")
 
@@ -101,10 +103,22 @@ def pick_main_track(tracks: list, index: int | None = None) -> tuple[int, dict]:
             raise DraftError(f"Видеодорожек всего {len(video)}, индекс {index} не существует.")
         return index, video[index]
 
-    best_idx = max(range(len(video)), key=lambda i: len(video[i].get("segments", [])))
-    if not video[best_idx].get("segments"):
+    best_idx = max(range(len(video)), key=lambda i: len(video[i].get("segments") or []))
+    if not (video[best_idx].get("segments") or []):
         raise DraftError("В проекте нет видеодорожек с клипами.")
     return best_idx, video[best_idx]
+
+
+def _matching_backups(backups_dir: Path, path: Path, prefix: str | None = None) -> list[Path]:
+    """Возвращает список файлов бэкапов для path без уязвимости к спецсимволам в имени."""
+    if not backups_dir.is_dir():
+        return []
+    head = f"{path.stem}.{prefix}_" if prefix else f"{path.stem}."
+    tail = path.suffix
+    return [
+        p for p in backups_dir.iterdir()
+        if p.is_file() and p.name.startswith(head) and (not tail or p.name.endswith(tail))
+    ]
 
 
 def save_draft_with_backup(path: Path, data: dict, prefix: str = "backup", max_backups: int = 5) -> Path:
@@ -114,12 +128,17 @@ def save_draft_with_backup(path: Path, data: dict, prefix: str = "backup", max_b
     """
     backups_dir = path.parent / ".backups"
     backups_dir.mkdir(parents=True, exist_ok=True)
-    backup = backups_dir / f"{path.stem}.{prefix}_{datetime.now():%Y%m%d_%H%M%S}{path.suffix}"
-    shutil.copy2(path, backup)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup = backups_dir / f"{path.stem}.{prefix}_{stamp}{path.suffix}"
+    counter = 1
+    while backup.exists():
+        backup = backups_dir / f"{path.stem}.{prefix}_{stamp}_{counter:02d}{path.suffix}"
+        counter += 1
+    shutil.copyfile(path, backup)
 
     # Ротация старых бэкапов данного типа
     if max_backups > 0:
-        old = sorted(backups_dir.glob(f"{path.stem}.{prefix}_*{path.suffix}"), reverse=True)
+        old = sorted(_matching_backups(backups_dir, path, prefix=prefix), key=lambda p: p.name, reverse=True)
         for obsolete in old[max_backups:]:
             try:
                 obsolete.unlink()
@@ -147,8 +166,8 @@ def restore_latest_backup(path: Path) -> Path:
     if not backups_dir.is_dir():
         raise DraftError("Папка .backups не найдена — откатывать нечего.")
     candidates = sorted(
-        backups_dir.glob(f"{path.stem}.*{path.suffix}"),
-        key=lambda p: p.stat().st_mtime,
+        _matching_backups(backups_dir, path),
+        key=lambda p: (p.stat().st_mtime, p.name),
         reverse=True,
     )
     if not candidates:
@@ -161,7 +180,7 @@ def restore_latest_backup(path: Path) -> Path:
     tmp_path = Path(tmp_name)
     try:
         os.close(fd)
-        shutil.copy2(latest, tmp_path)
+        shutil.copyfile(latest, tmp_path)
         os.replace(tmp_path, path)
     except Exception:
         if tmp_path.exists():
