@@ -1,1 +1,8 @@
 venv/
+.venv/
+__pycache__/
+*.pyc
+debug/
+downloads/
+gui_settings.json
+stock_config.json
