@@ -14,45 +14,91 @@ make_transitions.py — расставляет переходы по патте�
 """
 import argparse
 import json
-import os
-import shutil
-import subprocess
+import math
 import sys
 import uuid
-from datetime import datetime
 from pathlib import Path
+
+from capcut_common import (
+    DraftError as TransitionsError,
+    capcut_is_running,
+    default_cache_effect_dir,
+    find_draft_file,
+    load_draft,
+    pick_main_track,
+    save_draft_with_backup,
+)
 
 # ---------------------------------------------------------------------------
 # НАСТРОЙКИ
 # ---------------------------------------------------------------------------
-DURATIONS_MAP = {
+DEFAULT_DURATIONS_MAP = {
     "7159450506648097281": int(1.0 * 1000000),  # Размытие шаром (1с)
     "7140916992118100482": int(1.0 * 1000000),  # Вертикальное размытие (1с)
     "7184693655641264641": int(0.9 * 1000000),  # Шестиугольный зум (0.9с)
     "7140916996262072833": int(0.8 * 1000000),  # Горизонтальное размытие (0.8с)
 }
 
-# Порядок паттерна (по кругу). По умолчанию — порядок из DURATIONS_MAP.
-PATTERN = list(DURATIONS_MAP.keys())
+
+def load_transition_pattern() -> tuple[dict[str, int], list[str]]:
+    """Читает transitions_config.json (если есть) или возвращает настройки по умолчанию."""
+    base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    cfg_path = base_dir / "transitions_config.json"
+    durations = dict(DEFAULT_DURATIONS_MAP)
+    pattern = list(durations.keys())
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(cfg.get("durations_sec"), dict) and cfg["durations_sec"]:
+                parsed = {}
+                for k, v in cfg["durations_sec"].items():
+                    if isinstance(v, bool):
+                        continue
+                    sec = float(v)
+                    if not math.isfinite(sec):
+                        continue
+                    dur_us = round(sec * 1_000_000)
+                    if dur_us > 0:
+                        parsed[str(k)] = dur_us
+                if parsed:
+                    durations = parsed
+            if isinstance(cfg.get("pattern"), list) and cfg["pattern"]:
+                pattern = [str(x) for x in cfg["pattern"] if str(x) in durations]
+            else:
+                pattern = [x for x in pattern if x in durations]
+        except Exception as exc:
+            print(f"[!] Ошибка чтения transitions_config.json ({exc}), использую настройки по умолчанию.")
+    pattern = [x for x in pattern if x in durations]
+    return durations, pattern or list(durations.keys())
+
+
+DURATIONS_MAP, PATTERN = load_transition_pattern()
+
+_CACHE_EFFECT_DIR = default_cache_effect_dir()
+
+
+def _effect_path(effect_id: str, hash_dir: str) -> str:
+    return (_CACHE_EFFECT_DIR / effect_id / hash_dir).as_posix()
+
 
 # Запасные шаблоны. Если в проекте уже есть такой же переход — берутся свежие
 # данные из проекта (имя, путь в кэше CapCut, is_overlap).
 FALLBACK_TEMPLATES = {
     "7159450506648097281": {
         "name": "Размытие (шар)", "is_overlap": True,
-        "path": "C:/Users/user/AppData/Local/CapCut/User Data/Cache/effect/7159450506648097281/10478b300821fa6eccadf67b07b63208",
+        "path": _effect_path("7159450506648097281", "10478b300821fa6eccadf67b07b63208"),
     },
     "7140916992118100482": {
         "name": "Размытие по вертикали", "is_overlap": False,
-        "path": "C:/Users/user/AppData/Local/CapCut/User Data/Cache/effect/7140916992118100482/f55306a27ff8e0a8ae29584bb661ad73",
+        "path": _effect_path("7140916992118100482", "f55306a27ff8e0a8ae29584bb661ad73"),
     },
     "7184693655641264641": {
         "name": "Шестиугольный зум", "is_overlap": False,
-        "path": "C:/Users/user/AppData/Local/CapCut/User Data/Cache/effect/7184693655641264641/acfd328bcace433d08e7d64ae91261e3",
+        "path": _effect_path("7184693655641264641", "acfd328bcace433d08e7d64ae91261e3"),
     },
     "7140916996262072833": {
         "name": "Горизонтальное размытие", "is_overlap": True,
-        "path": "C:/Users/user/AppData/Local/CapCut/User Data/Cache/effect/7140916996262072833/0a5742430e336b3a1e1b6ff9983c5d25",
+        "path": _effect_path("7140916996262072833", "0a5742430e336b3a1e1b6ff9983c5d25"),
     },
 }
 
@@ -60,53 +106,11 @@ FALLBACK_TEMPLATES = {
 EPS = 1000
 
 
-class TransitionsError(Exception):
-    """Понятная ошибка для пользователя (CLI печатает её, GUI может показать)."""
-
-
 # ---------------------------------------------------------------------------
 # ВСПОМОГАТЕЛЬНОЕ
 # ---------------------------------------------------------------------------
 def new_id() -> str:
     return str(uuid.uuid4()).upper()
-
-
-def capcut_is_running() -> bool:
-    """True, если запущен CapCut (Windows). На других ОС возвращает False."""
-    if os.name != "nt":
-        return False
-    try:
-        out = subprocess.run(["tasklist"], capture_output=True, text=True,
-                             encoding="cp866", errors="ignore").stdout.lower()
-    except Exception:
-        return False
-    return "capcut.exe" in out or "capcutbox.exe" in out
-
-
-def find_draft_file(project: Path) -> Path:
-    """Ищет draft_content.json: сам файл, папка проекта, либо Timelines/*/draft_info.json."""
-    if project.is_file():
-        return project
-    direct = project / "draft_content.json"
-    if direct.exists():
-        return direct
-    # новые версии CapCut хранят таймлайны отдельно
-    cands = sorted((project / "Timelines").glob("*/draft_info.json")) \
-        if (project / "Timelines").exists() else []
-    if cands:
-        return cands[0]
-    raise TransitionsError(f"Не найден draft_content.json в: {project}")
-
-
-def load_draft(path: Path) -> dict:
-    raw = path.read_bytes()
-    try:
-        return json.loads(raw.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise TransitionsError(
-            f"{path.name} не читается как JSON — вероятно, он зашифрован этой версией "
-            "CapCut. Скрипт работает только с обычным (нешифрованным) draft_content.json."
-        )
 
 
 def build_transition(effect_id: str, duration: int, known: dict) -> dict:
@@ -137,14 +141,6 @@ def build_transition(effect_id: str, duration: int, known: dict) -> dict:
     }
 
 
-def pick_main_track(tracks: list) -> dict:
-    """Основная дорожка = видеодорожка с наибольшим числом сегментов."""
-    video = [t for t in tracks if t.get("type") == "video" and t.get("segments")]
-    if not video:
-        raise TransitionsError("В проекте нет видеодорожек с клипами.")
-    return max(video, key=lambda t: len(t["segments"]))
-
-
 def overlay_starts(tracks: list, main: dict) -> list:
     """Времена начала клипов на остальных видеодорожках (оверлеи)."""
     starts = []
@@ -165,6 +161,8 @@ def apply_transitions(project, dry_run=False, skip_overlays=False,
         raise TransitionsError("CapCut запущен. Закрой его полностью (иначе он перезапишет "
                                "изменения) или запусти с --force.")
 
+    durations_map, pattern = load_transition_pattern()
+
     data = load_draft(path)
     mats = data["materials"]
     trans_list = mats.setdefault("transitions", [])
@@ -174,7 +172,7 @@ def apply_transitions(project, dry_run=False, skip_overlays=False,
                               "is_overlap": t["is_overlap"]}
              for t in trans_list}
 
-    main_track = pick_main_track(data["tracks"])
+    _, main_track = pick_main_track(data["tracks"])
     # работаем с отсортированной копией, порядок сегментов в файле не трогаем
     segs = sorted(main_track["segments"], key=lambda s: s["target_timerange"]["start"])
     skip_times = overlay_starts(data["tracks"], main_track) if skip_overlays else []
@@ -209,10 +207,10 @@ def apply_transitions(project, dry_run=False, skip_overlays=False,
             skipped += 1
             continue
 
-        effect_id = PATTERN[k % len(PATTERN)]
+        effect_id = pattern[k % len(pattern)]
         k += 1
         limit = min(s["target_timerange"]["duration"], nxt["target_timerange"]["duration"]) // 2
-        duration = min(DURATIONS_MAP[effect_id], limit)
+        duration = min(durations_map[effect_id], limit)
 
         tr = build_transition(effect_id, duration, known)
         mats["transitions"].append(tr)
@@ -236,13 +234,7 @@ def apply_transitions(project, dry_run=False, skip_overlays=False,
         log("--dry-run: файл не изменён.")
         return stats
 
-    # бэкап + атомарная запись (сначала во временный файл, потом замена)
-    backup = path.with_name(f"{path.stem}.backup_{datetime.now():%Y%m%d_%H%M%S}.json")
-    shutil.copy2(path, backup)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-                   encoding="utf-8")
-    os.replace(tmp, path)
+    backup = save_draft_with_backup(path, data, prefix="transitions")
     stats["backup"] = backup.name
     log(f"Готово. Бэкап: {backup.name}")
     return stats

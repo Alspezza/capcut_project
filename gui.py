@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gui.py — оконный запуск make_transitions.py и clear_vids.py.
+gui.py — оконный запуск make_transitions.py, clear_vids.py и stock_fetcher.py.
 
-Положи рядом со скриптами (D:\\transitions_automatisation) и запускай:
+Запуск:
     python gui.py
 Чтобы окно открывалось без консоли — переименуй в gui.pyw и запускай двойным кликом.
 Зависимости самого GUI: только стандартная библиотека (tkinter).
-Для clear_vids.py по-прежнему нужны: pip install opencv-python numpy
+Для clear_vids.py нужны: pip install opencv-python numpy
+Для YouTube в stock_fetcher.py нужен: pip install yt-dlp
 """
 import json
+import math
 import os
 import queue
+import shlex
 import subprocess
 import sys
 import threading
@@ -21,11 +24,28 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-APP_DIR = Path(__file__).resolve().parent
-DEFAULT_DRAFTS = Path(r"D:\Для работы\CapCut Drafts")
+from capcut_common import (
+    DraftError,
+    capcut_is_running,
+    default_drafts_dir,
+    find_draft_file,
+    restore_latest_backup,
+)
+try:
+    import clear_vids
+    _CLEAR_VIDS_ERR = None
+except ImportError as exc:
+    clear_vids = None
+    _CLEAR_VIDS_ERR = exc
+import make_transitions
+import stock_fetcher
+
+IS_FROZEN = getattr(sys, "frozen", False)
+APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "gui_settings.json"
 SCRIPT_CLEAR = APP_DIR / "clear_vids.py"
 SCRIPT_TRANS = APP_DIR / "make_transitions.py"
+SCRIPT_STOCK = APP_DIR / "stock_fetcher.py"
 IS_WIN = os.name == "nt"
 
 
@@ -60,8 +80,14 @@ def scan_drafts(root: Path) -> dict:
     items = []
     if root.is_dir():
         for d in root.iterdir():
+            if not d.is_dir():
+                continue
             f = d / "draft_content.json"
-            if d.is_dir() and f.exists():
+            if not f.exists() and (d / "Timelines").exists():
+                cands = sorted((d / "Timelines").glob("*/draft_info.json"))
+                if cands:
+                    f = cands[0]
+            if f.exists():
                 items.append((f.stat().st_mtime, d))
     items.sort(reverse=True)
     out = {}
@@ -73,30 +99,19 @@ def scan_drafts(root: Path) -> dict:
     return out
 
 
-def capcut_running() -> bool:
-    if not IS_WIN:
-        return False
-    try:
-        r = subprocess.run(["tasklist"], capture_output=True, text=True,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-        low = r.stdout.lower()
-        return "capcut.exe" in low or "capcutlauncher" in low
-    except Exception:
-        return False
-
-
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("CapCut Automation")
-        self.geometry("980x720")
-        self.minsize(820, 600)
+        self.title("CapCut Automation + Stock Fetcher")
+        self.geometry("1000x760")
+        self.minsize(840, 620)
 
         self.cfg = load_settings()
-        self.drafts_dir = Path(self.cfg.get("drafts_dir", str(DEFAULT_DRAFTS)))
+        saved_dir = self.cfg.get("drafts_dir", "")
+        self.drafts_dir = Path(saved_dir) if saved_dir and Path(saved_dir).exists() else default_drafts_dir()
         self.drafts = {}
         self.proc = None
         self.running = False
@@ -114,6 +129,8 @@ class App(tk.Tk):
         self._build_vars()
         self._build_ui()
         self.refresh_drafts(select=self.cfg.get("last_project"))
+        self._update_stock_mode_ui()
+        self._refresh_api_status()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(60, self.poll_queue)
         self.after(500, self.update_capcut_status)
@@ -136,13 +153,52 @@ class App(tk.Tk):
         self.c_size = tk.StringVar(value=g("c_size", ""))
         self.c_probe = tk.StringVar(value=g("c_probe", ""))
         self.c_extra = tk.StringVar(value=g("c_extra", ""))
+        # stock fetcher
+        self.s_mode = tk.StringVar(value=g("s_mode", "yt"))
+        self.s_target = tk.StringVar(value=g("s_target", ""))
+        self.s_count = tk.StringVar(value=g("s_count", "3"))
+        self.s_duration = tk.StringVar(value=g("s_duration", "30"))
+        self.s_full = tk.BooleanVar(value=g("s_full", False))
+        self.s_batch_srv = tk.StringVar(value=g("s_batch_srv", "pexels"))
+        self.s_output = tk.StringVar(value=g("s_output", str(APP_DIR / "downloads")))
 
     # ---- интерфейс -------------------------------------------------------
     def _build_ui(self):
         pad = dict(padx=10, pady=6)
 
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="x", **pad)
+
+        tab_capcut = ttk.Frame(self.notebook)
+        tab_stock = ttk.Frame(self.notebook)
+        self.notebook.add(tab_capcut, text="  🎬 Обработка проекта (CapCut)  ")
+        self.notebook.add(tab_stock, text="  📥 Скачать видео (Stock Fetcher)  ")
+
+        self._build_capcut_tab(tab_capcut, pad)
+        self._build_stock_tab(tab_stock, pad)
+
+        # --- общий лог
+        lf = ttk.LabelFrame(self, text="Лог")
+        lf.pack(fill="both", expand=True, **pad)
+        self.log = ScrolledText(lf, wrap="word", font=("Consolas", 10), state="disabled",
+                                bg="#1e1e1e", fg="#dcdcdc", insertbackground="#dcdcdc")
+        self.log.pack(fill="both", expand=True, padx=6, pady=(6, 2))
+        self.log.tag_config("cmd", foreground="#7aa2f7")
+        self.log.tag_config("err", foreground="#f7768e")
+        self.log.tag_config("wm", foreground="#e0af68")
+        self.log.tag_config("ok", foreground="#9ece6a")
+        self.log.tag_config("dim", foreground="#8a8a8a")
+        lrow = ttk.Frame(lf)
+        lrow.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(lrow, text="Очистить лог", command=self.clear_log).pack(side="left")
+        self.progress = ttk.Progressbar(lrow, mode="indeterminate", length=160)
+        self.progress.pack(side="right")
+        self.lbl_status = ttk.Label(lrow, text="Готов")
+        self.lbl_status.pack(side="right", padx=8)
+
+    def _build_capcut_tab(self, parent, pad):
         # --- проект
-        pf = ttk.LabelFrame(self, text="Проект CapCut")
+        pf = ttk.LabelFrame(parent, text="Проект CapCut")
         pf.pack(fill="x", **pad)
         row = ttk.Frame(pf)
         row.pack(fill="x", padx=8, pady=(8, 2))
@@ -151,6 +207,7 @@ class App(tk.Tk):
         ttk.Button(row, text="Обзор…", command=self.browse_project).pack(side="left", padx=(6, 0))
         ttk.Button(row, text="⟳", width=3, command=lambda: self.refresh_drafts()).pack(side="left", padx=(4, 0))
         ttk.Button(row, text="Открыть папку", command=self.open_project_folder).pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="↩ Откатить бэкап", command=self.restore_backup).pack(side="left", padx=(4, 0))
 
         row2 = ttk.Frame(pf)
         row2.pack(fill="x", padx=8, pady=(0, 8))
@@ -161,12 +218,12 @@ class App(tk.Tk):
         self.lbl_capcut.pack(side="right", padx=12)
 
         # --- два блока настроек
-        mid = ttk.Frame(self)
+        mid = ttk.Frame(parent)
         mid.pack(fill="x", **pad)
         mid.columnconfigure(0, weight=1, uniform="a")
         mid.columnconfigure(1, weight=1, uniform="a")
 
-        # Вотермарки / масштаб (запускается первым)
+        # Вотермарки / масштаб
         cf = ttk.LabelFrame(mid, text="1. Масштаб + вотермарка  (clear_vids.py)")
         cf.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         r = ttk.Frame(cf)
@@ -189,8 +246,7 @@ class App(tk.Tk):
         ]
         for i, (lab, var, hint) in enumerate(fields):
             ttk.Label(adv, text=lab).grid(row=i, column=0, sticky="w", padx=6, pady=2)
-            e = ttk.Entry(adv, textvariable=var)
-            e.grid(row=i, column=1, sticky="ew", padx=6, pady=2)
+            ttk.Entry(adv, textvariable=var).grid(row=i, column=1, sticky="ew", padx=6, pady=2)
             ttk.Label(adv, text=hint, foreground="#999").grid(row=i, column=2, sticky="w", padx=(0, 6))
         adv.columnconfigure(1, weight=1)
 
@@ -202,39 +258,169 @@ class App(tk.Tk):
         tf.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ttk.Checkbutton(tf, text="Пробный прогон (ничего не записывать)", variable=self.t_dry).pack(anchor="w", padx=8, pady=(10, 2))
         ttk.Checkbutton(tf, text="Пропускать стыки, где начинается оверлей", variable=self.t_skip).pack(anchor="w", padx=8, pady=2)
-        ttk.Label(tf, text="Паттерн и длительности задаются в самом\nmake_transitions.py (DURATIONS_MAP).",
-                  foreground="#888", justify="left").pack(anchor="w", padx=8, pady=10)
+        ttk.Button(tf, text="⚙ Настроить паттерн переходов…", command=self.open_transitions_editor).pack(
+            anchor="w", padx=8, pady=(8, 2))
+        ttk.Label(tf, text="Настройки сохраняются в transitions_config.json.",
+                  foreground="#888", justify="left").pack(anchor="w", padx=8, pady=4)
         ttk.Frame(tf).pack(expand=True, fill="both")
         ttk.Button(tf, text="▶  Запустить", style="Run.TButton",
                    command=lambda: self.start(["trans"])).pack(fill="x", padx=8, pady=(4, 8), side="bottom")
 
         # --- общие кнопки
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=10, pady=(2, 4))
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=10, pady=(2, 8))
         self.btn_both = ttk.Button(bar, text="▶▶  Запустить оба подряд (масштаб → переходы)",
                                    style="Big.TButton", command=lambda: self.start(["clear", "trans"]))
         self.btn_both.pack(side="left", fill="x", expand=True)
         self.btn_stop = ttk.Button(bar, text="■ Стоп", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(8, 0), ipady=8)
 
-        # --- лог
-        lf = ttk.LabelFrame(self, text="Лог")
-        lf.pack(fill="both", expand=True, **pad)
-        self.log = ScrolledText(lf, wrap="word", font=("Consolas", 10), state="disabled",
-                                bg="#1e1e1e", fg="#dcdcdc", insertbackground="#dcdcdc")
-        self.log.pack(fill="both", expand=True, padx=6, pady=(6, 2))
-        self.log.tag_config("cmd", foreground="#7aa2f7")
-        self.log.tag_config("err", foreground="#f7768e")
-        self.log.tag_config("wm", foreground="#e0af68")
-        self.log.tag_config("ok", foreground="#9ece6a")
-        self.log.tag_config("dim", foreground="#8a8a8a")
-        lrow = ttk.Frame(lf)
-        lrow.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Button(lrow, text="Очистить лог", command=self.clear_log).pack(side="left")
-        self.progress = ttk.Progressbar(lrow, mode="indeterminate", length=160)
-        self.progress.pack(side="right")
-        self.lbl_status = ttk.Label(lrow, text="Готов")
-        self.lbl_status.pack(side="right", padx=8)
+    def _build_stock_tab(self, parent, pad):
+        sf = ttk.LabelFrame(parent, text="Источник видео")
+        sf.pack(fill="x", **pad)
+        mrow = ttk.Frame(sf)
+        mrow.pack(fill="x", padx=8, pady=8)
+        modes = [
+            ("YouTube (ссылка / .txt)", "yt"),
+            ("Pexels (поиск)", "pexels"),
+            ("Pixabay (поиск)", "pixabay"),
+            ("Пакетно по тегам (.txt)", "batch-tags"),
+        ]
+        for text, val in modes:
+            ttk.Radiobutton(mrow, text=text, value=val, variable=self.s_mode,
+                            command=self._update_stock_mode_ui).pack(side="left", padx=(0, 14))
+
+        self.lbl_api_status = ttk.Label(mrow, text="", foreground="#666")
+        self.lbl_api_status.pack(side="right")
+        ttk.Button(mrow, text="⚙ API-ключи…", command=self.open_stock_settings).pack(side="right", padx=(0, 8))
+
+        pf = ttk.LabelFrame(parent, text="Параметры загрузки")
+        pf.pack(fill="x", **pad)
+
+        # Строка цели (URL / запрос / файл)
+        r1 = ttk.Frame(pf)
+        r1.pack(fill="x", padx=8, pady=(8, 4))
+        self.lbl_s_target = ttk.Label(r1, text="Ссылка / файл:", width=18)
+        self.lbl_s_target.pack(side="left")
+        ttk.Entry(r1, textvariable=self.s_target).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.btn_s_browse_file = ttk.Button(r1, text="Файл…", command=self.browse_stock_file)
+        self.btn_s_browse_file.pack(side="left", padx=(6, 0))
+
+        # Строка опций (количество / длительность / сервис)
+        r2 = ttk.Frame(pf)
+        r2.pack(fill="x", padx=8, pady=4)
+        self.lbl_s_param = ttk.Label(r2, text="Длительность (сек):", width=18)
+        self.lbl_s_param.pack(side="left")
+        self.ent_s_duration = ttk.Entry(r2, textvariable=self.s_duration, width=8)
+        self.ent_s_count = ttk.Entry(r2, textvariable=self.s_count, width=8)
+        self.chk_s_full = ttk.Checkbutton(r2, text="Скачать видео целиком (игнорировать таймкод)", variable=self.s_full)
+        self.cmb_s_srv = ttk.Combobox(r2, textvariable=self.s_batch_srv, values=["pexels", "pixabay"], state="readonly", width=10)
+
+        # Строка папки назначения
+        r3 = ttk.Frame(pf)
+        r3.pack(fill="x", padx=8, pady=(4, 8))
+        ttk.Label(r3, text="Папка сохранения:", width=18).pack(side="left")
+        ttk.Entry(r3, textvariable=self.s_output).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Button(r3, text="Обзор…", command=self.browse_stock_output).pack(side="left", padx=(6, 0))
+        ttk.Button(r3, text="В папку проекта", command=self.set_stock_output_to_project).pack(side="left", padx=(4, 0))
+        ttk.Button(r3, text="Открыть", command=self.open_stock_output).pack(side="left", padx=(4, 0))
+
+        # Кнопка запуска
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=10, pady=(2, 8))
+        self.btn_stock_run = ttk.Button(bar, text="▶  Скачать видео", style="Big.TButton",
+                                        command=lambda: self.start(["stock"]))
+        self.btn_stock_run.pack(side="left", fill="x", expand=True)
+        self.btn_stock_stop = ttk.Button(bar, text="■ Стоп", command=self.stop, state="disabled")
+        self.btn_stock_stop.pack(side="left", padx=(8, 0), ipady=8)
+
+    def _update_stock_mode_ui(self):
+        mode = self.s_mode.get()
+        for w in (self.ent_s_duration, self.ent_s_count, self.chk_s_full, self.cmb_s_srv):
+            w.pack_forget()
+
+        if mode == "yt":
+            self.lbl_s_target.config(text="URL или .txt файл:")
+            self.btn_s_browse_file.config(state="normal")
+            self.lbl_s_param.config(text="Фрагмент (сек):")
+            self.ent_s_duration.pack(side="left", padx=4)
+            self.chk_s_full.pack(side="left", padx=10)
+        elif mode in ("pexels", "pixabay"):
+            self.lbl_s_target.config(text="Запрос (англ.):")
+            self.btn_s_browse_file.config(state="disabled")
+            self.lbl_s_param.config(text="Количество видео:")
+            self.ent_s_count.pack(side="left", padx=4)
+        else:  # batch-tags
+            self.lbl_s_target.config(text="Файл тегов (.txt):")
+            self.btn_s_browse_file.config(state="normal")
+            self.lbl_s_param.config(text="Видео на тег / сервис:")
+            self.ent_s_count.pack(side="left", padx=4)
+            self.cmb_s_srv.pack(side="left", padx=8)
+
+    def _refresh_api_status(self):
+        cfg = stock_fetcher.load_config()
+        pex = "Pexels ✓" if cfg.get("pexels_api_key") else "Pexels ✗"
+        pix = "Pixabay ✓" if cfg.get("pixabay_api_key") else "Pixabay ✗"
+        self.lbl_api_status.config(text=f"{pex}  |  {pix}")
+
+    def open_stock_settings(self):
+        cfg = stock_fetcher.load_config()
+        win = tk.Toplevel(self)
+        win.title("Настройки Stock Fetcher (API-ключи)")
+        win.geometry("500x190")
+        win.transient(self)
+        win.grab_set()
+
+        v_pex = tk.StringVar(value=cfg.get("pexels_api_key", ""))
+        v_pix = tk.StringVar(value=cfg.get("pixabay_api_key", ""))
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Pexels API Key:").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=v_pex, width=48).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(frm, text="Pixabay API Key:").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=v_pix, width=48).grid(row=1, column=1, sticky="ew", padx=6)
+        ttk.Label(frm, text="Ключи сохраняются локально в stock_config.json", foreground="#666").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=4)
+        frm.columnconfigure(1, weight=1)
+
+        def on_save():
+            stock_fetcher.save_config({
+                "pexels_api_key": v_pex.get().strip(),
+                "pixabay_api_key": v_pix.get().strip(),
+            })
+            self._refresh_api_status()
+            win.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="Сохранить", command=on_save).pack(side="right")
+        ttk.Button(btns, text="Отмена", command=win.destroy).pack(side="right", padx=6)
+
+    def browse_stock_file(self):
+        p = filedialog.askopenfilename(title="Выберите .txt файл", filetypes=[("Text files", "*.txt"), ("All", "*.*")])
+        if p:
+            self.s_target.set(p)
+
+    def browse_stock_output(self):
+        d = filedialog.askdirectory(title="Папка для скачанных видео", initialdir=self.s_output.get() or str(APP_DIR))
+        if d:
+            self.s_output.set(d)
+
+    def set_stock_output_to_project(self):
+        p = self.current_project()
+        if p and p.is_dir():
+            self.s_output.set(str(p / "stock_media"))
+        else:
+            messagebox.showinfo("Проект не выбран", "Сначала выбери проект CapCut на первой вкладке.")
+
+    def open_stock_output(self):
+        d = Path(self.s_output.get().strip() or (APP_DIR / "downloads"))
+        d.mkdir(parents=True, exist_ok=True)
+        if IS_WIN:
+            os.startfile(d)  # noqa
+        else:
+            subprocess.Popen(["xdg-open", str(d)])
 
     # ---- проекты ---------------------------------------------------------
     def refresh_drafts(self, select=None):
@@ -278,8 +464,120 @@ class App(tk.Tk):
             else:
                 subprocess.Popen(["xdg-open", str(folder)])
 
+    def restore_backup(self):
+        if self.running:
+            return
+        project = self.current_project()
+        if not project:
+            messagebox.showerror("Проект не выбран", "Выбери проект CapCut.")
+            return
+        try:
+            draft_path = find_draft_file(project)
+        except DraftError as exc:
+            messagebox.showerror("Ошибка", str(exc))
+            return
+        if capcut_is_running():
+            if not messagebox.askyesno(
+                    "CapCut запущен",
+                    "CapCut сейчас открыт и может перезаписать восстановленный файл.\nВсё равно откатить?"):
+                return
+        if not messagebox.askyesno(
+                "Откат бэкапа",
+                f"Восстановить самый свежий бэкап из .backups для:\n{draft_path}?"):
+            return
+        try:
+            restored = restore_latest_backup(draft_path)
+            self.write(f"\nГотово: восстановлен бэкап {restored.name}\n", "ok")
+            self.lbl_status.config(text=f"Откачено: {restored.name}")
+        except DraftError as exc:
+            messagebox.showerror("Не удалось откатить", str(exc))
+
+    def open_transitions_editor(self):
+        durations, pattern = make_transitions.load_transition_pattern()
+        all_ids = list(dict.fromkeys(
+            list(pattern) + list(durations.keys()) + list(make_transitions.DEFAULT_DURATIONS_MAP.keys())
+        ))
+        names = {k: v["name"] for k, v in make_transitions.FALLBACK_TEMPLATES.items()}
+
+        win = tk.Toplevel(self)
+        win.title("Паттерн переходов (transitions_config.json)")
+        win.geometry("540x320")
+        win.transient(self)
+        win.grab_set()
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Отметьте переходы, задайте длительность (сек) и порядок:").pack(anchor="w", pady=(0, 8))
+
+        rows_frame = ttk.Frame(frm)
+        rows_frame.pack(fill="both", expand=True)
+
+        rows = []
+        for eid in all_ids:
+            enabled = tk.BooleanVar(value=eid in pattern)
+            dur_val = durations.get(eid, make_transitions.DEFAULT_DURATIONS_MAP.get(eid, 1_000_000)) / 1_000_000
+            dur_var = tk.StringVar(value=f"{dur_val:.3f}".rstrip("0").rstrip("."))
+            rows.append([eid, enabled, dur_var])
+
+        def redraw():
+            for ch in rows_frame.winfo_children():
+                ch.destroy()
+            for idx, (eid, en_var, dur_var) in enumerate(rows):
+                r = ttk.Frame(rows_frame)
+                r.pack(fill="x", pady=3)
+                ttk.Checkbutton(r, variable=en_var).pack(side="left")
+                ttk.Label(r, text=f"{names.get(eid, eid)} ({eid})", width=36).pack(side="left", padx=4)
+                ttk.Entry(r, textvariable=dur_var, width=7).pack(side="left", padx=4)
+                ttk.Label(r, text="сек").pack(side="left")
+                ttk.Button(r, text="↑", width=3, command=lambda i=idx: move(i, -1)).pack(side="right", padx=2)
+                ttk.Button(r, text="↓", width=3, command=lambda i=idx: move(i, 1)).pack(side="right", padx=2)
+
+        def move(idx, delta):
+            nxt = idx + delta
+            if 0 <= nxt < len(rows):
+                rows[idx], rows[nxt] = rows[nxt], rows[idx]
+                redraw()
+
+        def on_reset():
+            cfg_path = APP_DIR / "transitions_config.json"
+            if cfg_path.exists():
+                cfg_path.unlink()
+            win.destroy()
+            self.write("\nСброшен transitions_config.json к значениям по умолчанию.\n", "ok")
+
+        def on_save():
+            new_durs = {}
+            new_pat = []
+            try:
+                for eid, en_var, dur_var in rows:
+                    sec = float(dur_var.get().strip().replace(",", "."))
+                    if not math.isfinite(sec) or round(sec, 3) <= 0:
+                        raise ValueError("Длительность должна быть > 0")
+                    new_durs[eid] = round(sec, 3)
+                    if en_var.get():
+                        new_pat.append(eid)
+                if not new_pat:
+                    raise ValueError("Нужно выбрать хотя бы один переход")
+            except ValueError as exc:
+                messagebox.showerror("Ошибка", str(exc), parent=win)
+                return
+            cfg_path = APP_DIR / "transitions_config.json"
+            cfg_path.write_text(
+                json.dumps({"durations_sec": new_durs, "pattern": new_pat}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.write(f"\nГотово: сохранён паттерн переходов ({len(new_pat)} шт.) в transitions_config.json\n", "ok")
+            win.destroy()
+
+        redraw()
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="Сбросить по умолчанию", command=on_reset).pack(side="left")
+        ttk.Button(btns, text="Сохранить", command=on_save).pack(side="right")
+        ttk.Button(btns, text="Отмена", command=win.destroy).pack(side="right", padx=6)
+
     def update_capcut_status(self):
-        if capcut_running():
+        if capcut_is_running():
             self.lbl_capcut.config(text="⚠ CapCut запущен — закрой его", foreground="#c0392b")
         else:
             self.lbl_capcut.config(text="CapCut закрыт ✓", foreground="#2e8b57")
@@ -300,36 +598,67 @@ class App(tk.Tk):
     @staticmethod
     def classify(line: str):
         low = line.lower()
-        if "ошибка" in low or "traceback" in low or "error" in low or "не найден" in low:
+        if "ошибка" in low or "traceback" in low or "error" in low or "не найден" in low or "[!]" in low:
             return "err"
         if "вотермарка" in low:
             return "wm"
-        if line.startswith("Готово") or "файл не изменён" in low:
+        if line.startswith("Готово") or "файл не изменён" in low or "[✓]" in low:
             return "ok"
         if line.startswith("[") and "чисто" in low:
             return "dim"
         return None
 
     # ---- команды ---------------------------------------------------------
-    def build_cmd(self, kind, project: Path):
+    def _python_exe(self) -> str:
         py = sys.executable
         if IS_WIN and py.lower().endswith("pythonw.exe"):
             cand = py[:-len("pythonw.exe")] + "python.exe"
             if os.path.exists(cand):
-                py = cand
+                return cand
+        return py
+
+    def _base_worker_cmd(self, kind: str, script_path: Path) -> list[str]:
+        if IS_FROZEN:
+            return [sys.executable, "--run-worker", kind]
+        return [self._python_exe(), "-u", str(script_path)]
+
+    def build_cmd(self, kind, project: Path | None):
+        if kind == "stock":
+            mode = self.s_mode.get()
+            target = self.s_target.get().strip()
+            if not target:
+                raise ValueError("Укажи ссылку, поисковый запрос или файл.")
+            out_dir = self.s_output.get().strip() or str(APP_DIR / "downloads")
+            cmd = self._base_worker_cmd("stock", SCRIPT_STOCK) + [mode, target, "-o", out_dir]
+            if mode == "yt":
+                dur = self.s_duration.get().strip() or "30"
+                if int(dur) <= 0:
+                    raise ValueError("Длительность фрагмента должна быть > 0")
+                cmd += ["-d", dur]
+                if self.s_full.get():
+                    cmd.append("--full")
+            else:
+                cnt = self.s_count.get().strip() or "3"
+                if int(cnt) <= 0:
+                    raise ValueError("Количество видео должно быть > 0")
+                cmd += ["-n", cnt]
+                if mode == "batch-tags":
+                    cmd += ["--service", self.s_batch_srv.get()]
+            return cmd
 
         if kind == "trans":
-            cmd = [py, "-u", str(SCRIPT_TRANS), str(project)]
+            cmd = self._base_worker_cmd("trans", SCRIPT_TRANS) + [str(project)]
             if self.t_dry.get():
                 cmd.append("--dry-run")
             if self.t_skip.get():
                 cmd.append("--skip-overlays")
             return cmd
 
-        cmd = [py, "-u", str(SCRIPT_CLEAR), str(project)]
+        cmd = self._base_worker_cmd("clear", SCRIPT_CLEAR) + [str(project)]
         scale = self.c_scale.get().strip().replace(",", ".")
         if scale:
-            float(scale)  # проверка
+            if float(scale) <= 0:
+                raise ValueError("Масштаб должен быть > 0")
             cmd += ["--scale", scale]
         if self.c_dry.get():
             cmd.append("--dry-run")
@@ -348,30 +677,40 @@ class App(tk.Tk):
         if self.c_probe.get().strip():
             cmd += ["--probe-times"] + self.c_probe.get().replace(",", ".").split()
         if self.c_extra.get().strip():
-            import shlex
             cmd += shlex.split(self.c_extra.get(), posix=not IS_WIN)
         return cmd
 
     def start(self, kinds):
         if self.running:
             return
-        project = self.current_project()
-        if not project or not (project.is_file() or (project / "draft_content.json").exists()):
-            messagebox.showerror("Проект не выбран", "Выбери папку проекта, в которой есть draft_content.json.")
-            return
-        for k in kinds:
-            script = SCRIPT_CLEAR if k == "clear" else SCRIPT_TRANS
-            if not script.exists():
-                messagebox.showerror("Нет скрипта", f"Не найден файл:\n{script}")
+
+        need_project = any(k in ("clear", "trans") for k in kinds)
+        project = self.current_project() if need_project else None
+        if need_project:
+            has_draft = project and (
+                project.is_file()
+                or (project / "draft_content.json").exists()
+                or ((project / "Timelines").exists() and any((project / "Timelines").glob("*/draft_info.json")))
+            )
+            if not has_draft:
+                messagebox.showerror("Проект не выбран", "Выбери папку проекта, в которой есть draft_content.json.")
                 return
+
+        if not IS_FROZEN:
+            script_map = {"clear": SCRIPT_CLEAR, "trans": SCRIPT_TRANS, "stock": SCRIPT_STOCK}
+            for k in kinds:
+                if not script_map[k].exists():
+                    messagebox.showerror("Нет скрипта", f"Не найден файл:\n{script_map[k]}")
+                    return
+
         try:
             cmds = [(k, self.build_cmd(k, project)) for k in kinds]
-        except ValueError:
-            messagebox.showerror("Неверное значение", "Проверь числовые поля (масштаб, пороги).")
+        except ValueError as exc:
+            messagebox.showerror("Неверное значение", f"Проверь заполненные поля:\n{exc}")
             return
 
         will_write = (("clear" in kinds and not self.c_dry.get()) or ("trans" in kinds and not self.t_dry.get()))
-        if will_write and capcut_running():
+        if will_write and capcut_is_running():
             if not messagebox.askyesno(
                     "CapCut запущен",
                     "CapCut сейчас открыт — он может перезаписать изменения.\n"
@@ -385,11 +724,12 @@ class App(tk.Tk):
         threading.Thread(target=self.worker, args=(cmds,), daemon=True).start()
 
     def worker(self, cmds):
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
         flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
         ok_all = True
+        titles = {"clear": "Масштаб + вотермарка", "trans": "Переходы", "stock": "Скачивание видео"}
         for n, (kind, cmd) in enumerate(cmds, 1):
-            title = "Масштаб + вотермарка" if kind == "clear" else "Переходы"
+            title = titles.get(kind, kind)
             self.q.put(("line", f"\n=== {n}/{len(cmds)}: {title} ===\n", "cmd"))
             self.q.put(("line", "> " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n", "dim"))
             self.q.put(("status", f"Выполняется: {title}…"))
@@ -417,6 +757,17 @@ class App(tk.Tk):
     def stop(self):
         if self.proc and self.proc.poll() is None:
             self.stop_flag = True
+            if IS_WIN:
+                try:
+                    subprocess.Popen(
+                        ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    return
+                except Exception:
+                    pass
             self.proc.terminate()
 
     def poll_queue(self):
@@ -438,17 +789,21 @@ class App(tk.Tk):
 
     def set_busy(self, busy):
         self.btn_stop.config(state="normal" if busy else "disabled")
+        self.btn_stock_stop.config(state="normal" if busy else "disabled")
         self.btn_both.config(state="disabled" if busy else "normal")
+        self.btn_stock_run.config(state="disabled" if busy else "normal")
         for w in self.winfo_children():
             self._toggle_buttons(w, busy)
         if busy:
             self.progress.start(12)
         else:
             self.progress.stop()
+            self._update_stock_mode_ui()
 
     def _toggle_buttons(self, widget, busy):
+        skip = (self.btn_stop, self.btn_stock_stop, self.btn_both, self.btn_stock_run)
         for ch in widget.winfo_children():
-            if isinstance(ch, ttk.Button) and ch not in (self.btn_stop, self.btn_both):
+            if isinstance(ch, ttk.Button) and ch not in skip:
                 ch.config(state="disabled" if busy else "normal")
             self._toggle_buttons(ch, busy)
 
@@ -461,7 +816,11 @@ class App(tk.Tk):
             c_dry=self.c_dry.get(), c_scale=self.c_scale.get(), c_reset=self.c_reset.get(),
             c_debug=self.c_debug.get(), c_thr=self.c_thr.get(), c_thr_single=self.c_thr_single.get(),
             c_track=self.c_track.get(), c_size=self.c_size.get(), c_probe=self.c_probe.get(),
-            c_extra=self.c_extra.get())
+            c_extra=self.c_extra.get(),
+            s_mode=self.s_mode.get(), s_target=self.s_target.get(), s_count=self.s_count.get(),
+            s_duration=self.s_duration.get(), s_full=self.s_full.get(),
+            s_batch_srv=self.s_batch_srv.get(), s_output=self.s_output.get(),
+        )
         save_settings(self.cfg)
 
     def on_close(self):
@@ -473,5 +832,31 @@ class App(tk.Tk):
         self.destroy()
 
 
+def _dispatch_worker() -> bool:
+    """Точка входа для дочерних процессов при запуске собранного .exe."""
+    if len(sys.argv) >= 3 and sys.argv[1] == "--run-worker":
+        for stream in (sys.stdout, sys.stderr):
+            if stream and hasattr(stream, "reconfigure"):
+                try:
+                    stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+                except Exception:
+                    pass
+        kind = sys.argv[2]
+        sys.argv = [sys.argv[0]] + sys.argv[3:]
+        if kind == "clear":
+            if clear_vids is None:
+                sys.exit(f"Не удалось загрузить clear_vids: {_CLEAR_VIDS_ERR}")
+            clear_vids.main()
+        elif kind == "trans":
+            make_transitions.main()
+        elif kind == "stock":
+            stock_fetcher.main()
+        else:
+            sys.exit(f"Неизвестный режим: {kind}")
+        return True
+    return False
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    if not _dispatch_worker():
+        App().mainloop()

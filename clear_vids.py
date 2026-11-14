@@ -38,15 +38,24 @@ clear_vids.py — подготовка ИИ-клипов в проекте CapCu
 """
 
 import argparse
-import json
 import os
-import shutil
 import sys
-import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import cv2
 import numpy as np
+
+from capcut_common import (
+    DraftError,
+    capcut_is_running,
+    find_draft_file,
+    load_draft,
+    pick_main_track,
+    save_draft_with_backup,
+)
 
 REF_W = 1280  # все кадры приводятся к ширине 1280
 
@@ -65,6 +74,7 @@ SIZE_STEPS = (0.8, 0.9, 1.0, 1.1, 1.25)  # допуск по размеру зв
 STAR_EXP = 0.8                            # форма: |x|^p + |y|^p <= 1 (подогнано по реальной звёздочке)
 
 _star_cache = {}
+_star_lock = threading.Lock()
 
 
 # ----------------------------------------------------------------------------
@@ -91,8 +101,9 @@ def read_frame(cap, t_sec):
 def star_template(size):
     """Шаблон: белая 4-лучевая звезда шириной size px на чёрном поле с запасом вокруг."""
     key = round(size, 1)
-    if key in _star_cache:
-        return _star_cache[key]
+    with _star_lock:
+        if key in _star_cache:
+            return _star_cache[key]
     pad = 0.35
     k = 1 + 2 * pad
     n = int(round(size * k)) | 1
@@ -100,7 +111,8 @@ def star_template(size):
     yy, xx = np.mgrid[-1:1:complex(N), -1:1:complex(N)]
     m = ((np.abs(xx * k) ** STAR_EXP + np.abs(yy * k) ** STAR_EXP) <= 1).astype(np.float32)
     t = cv2.resize(m, (n, n), interpolation=cv2.INTER_AREA)
-    _star_cache[key] = t
+    with _star_lock:
+        _star_cache[key] = t
     return t
 
 
@@ -139,14 +151,6 @@ def score_marks(gray, marks, margin):
 # ----------------------------------------------------------------------------
 # Работа с драфтом CapCut
 # ----------------------------------------------------------------------------
-def find_draft_file(p):
-    if os.path.isdir(p):
-        p = os.path.join(p, "draft_content.json")
-    if not os.path.isfile(p):
-        sys.exit(f"Не найден draft_content.json: {p}")
-    return p
-
-
 def left_align_shift(mat_w, mat_h, canvas_w, canvas_h, scale):
     """
     Значение clip.transform.x, при котором левый край клипа совпадает с левым
@@ -154,6 +158,8 @@ def left_align_shift(mat_w, mat_h, canvas_w, canvas_h, scale):
     (x = 1.0 — сдвиг на пол-кадра вправо).
     Для 16:9 на холсте 16:9 получается scale - 1 (при 1.15 → 0.15).
     """
+    if mat_h <= 0 or canvas_h <= 0 or canvas_w <= 0:
+        return 0.0
     ar_clip, ar_canvas = mat_w / mat_h, canvas_w / canvas_h
     disp_w_frac = scale if ar_clip >= ar_canvas else scale * ar_clip / ar_canvas  # ширина клипа / ширина холста
     return max(0.0, disp_w_frac - 1.0)
@@ -179,11 +185,22 @@ def detect_watermark(mat, seg, marks, stack_thr, single_thr, margin, probe_times
 
     start = src["start"] / 1e6
     dur = src["duration"] / 1e6
+    if not probe_times:
+        eff_probes = [0.0]
+    elif dur > 0 and len(probe_times) > 1 and dur < max(probe_times):
+        # Для коротких клипов равномерно распределяем кадры по длине сегмента
+        n_pts = min(len(probe_times), max(3, int(round(dur * 5))))
+        eff_probes = [dur * (0.05 + 0.85 * idx / (n_pts - 1)) for idx in range(n_pts)]
+    else:
+        eff_probes = [
+            min(pt, dur * 0.95) if dur > 0 else 0.0
+            for i, pt in enumerate(probe_times)
+            if i == 0 or pt <= dur * 0.95
+        ]
+
     frames = []
-    for i, pt in enumerate(probe_times):
-        if i > 0 and pt > dur * 0.95:  # кадр за пределами клипа — пропускаем (первый берём всегда)
-            continue
-        fr = read_frame(cap, start + min(pt, dur * 0.5))
+    for pt in eff_probes:
+        fr = read_frame(cap, start + pt)
         if fr is not None:
             frames.append(fr)
     cap.release()
@@ -275,6 +292,9 @@ def main():
     ap.add_argument("--reset-clean", action="store_true",
                     help="у клипов БЕЗ вотермарки сбрасывать сдвиг по X в 0 (по умолч. не трогать)")
     ap.add_argument("--dry-run", action="store_true", help="ничего не записывать, только отчёт")
+    ap.add_argument("--force", action="store_true", help="не проверять, запущен ли CapCut")
+    ap.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
+                    help="число потоков для анализа видео (по умолч. до 4)")
     ap.add_argument("--debug-dir", default=None, help="папка для картинок проверки (угол кадра + рамка найденной звезды)")
     args = ap.parse_args()
 
@@ -286,34 +306,45 @@ def main():
     else:
         stack_thr = list(DEFAULT_STACK_THR)
 
-    draft_path = find_draft_file(args.project)
-    with open(draft_path, "r", encoding="utf-8") as f:
-        draft = json.load(f)
+    try:
+        draft_path = find_draft_file(args.project)
+        if not args.dry_run and not args.force and capcut_is_running():
+            raise DraftError(
+                "CapCut запущен. Закрой его полностью (иначе он перезапишет изменения) "
+                "или запусти с --force."
+            )
+        draft = load_draft(draft_path)
+        track_idx = 0 if args.track is None else args.track
+        idx, track = pick_main_track(draft["tracks"], track_idx)
+    except DraftError as e:
+        sys.exit(f"Ошибка: {e}")
 
     canvas_w = draft["canvas_config"]["width"]
     canvas_h = draft["canvas_config"]["height"]
     materials = {m["id"]: m for m in draft["materials"]["videos"]}
-
-    video_tracks = [t for t in draft["tracks"] if t["type"] == "video"]
-    if not video_tracks:
-        sys.exit("В проекте нет видеодорожек")
-    idx = args.track if args.track is not None else 0
-    if idx >= len(video_tracks):
-        sys.exit(f"Видеодорожек всего {len(video_tracks)}, индекс {idx} не существует")
-    track = video_tracks[idx]
     segs = track["segments"]
-    print(f"Проект: {draft.get('name') or os.path.basename(os.path.dirname(draft_path))}")
+    print(f"Проект: {draft.get('name') or draft_path.parent.name}")
     print(f"Холст: {canvas_w}x{canvas_h} | видеодорожка #{idx}: {len(segs)} сегментов | масштаб {args.scale:.2f} | "
           f"пороги (среднее/кадр): {'/'.join(f'{t:.2f}' for t in stack_thr)} / {args.threshold_single:.2f} | кадры: {', '.join(str(t) for t in args.probe_times)} с")
 
     want_size = None
     if args.size:
-        want_size = tuple(int(v) for v in args.size.lower().split("x"))
+        try:
+            parts = [int(v) for v in args.size.lower().split("x")]
+            if len(parts) != 2 or parts[0] <= 0 or parts[1] <= 0:
+                raise ValueError
+            want_size = (parts[0], parts[1])
+        except ValueError:
+            sys.exit(f"--size: неверный формат '{args.size}', ожидается ШИРИНАxВЫСОТА, напр. 1280x720")
 
     cache = {}
     n_wm = n_clean = n_skip = n_err = 0
     t0 = time.time()
     order = sorted(range(len(segs)), key=lambda i: segs[i]["target_timerange"]["start"])
+
+    # Предварительно отбираем сегменты и параллельно анализируем уникальные клипы
+    active_items = []
+    unique_tasks = {}
     for num, i in enumerate(order, 1):
         seg = segs[i]
         mat = materials.get(seg.get("material_id"))
@@ -328,7 +359,25 @@ def main():
             print(f"[{tag}] пропуск: у сегмента есть ключевые кадры")
             n_skip += 1
             continue
+        active_items.append((tag, seg, mat))
+        src = seg["source_timerange"]
+        key = (norm_path(mat["path"]), src["start"], src["duration"])
+        if key not in unique_tasks:
+            unique_tasks[key] = (mat, seg, tag)
 
+    workers = max(1, args.workers)
+    if workers > 1 and len(unique_tasks) > 1:
+        def _run_one(item):
+            k, (m, s, tg) = item
+            return k, detect_watermark(
+                m, s, marks, stack_thr, args.threshold_single, args.margin, args.probe_times,
+                args.debug_dir, tg, {})
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(unique_tasks))) as pool:
+            for k, res in pool.map(_run_one, unique_tasks.items()):
+                cache[k] = res
+
+    for tag, seg, mat in active_items:
         found, results = detect_watermark(
             mat, seg, marks, stack_thr, args.threshold_single, args.margin, args.probe_times,
             args.debug_dir, tag, cache)
@@ -349,7 +398,8 @@ def main():
             shift = left_align_shift(mat["width"], mat["height"], canvas_w, canvas_h, args.scale)
             clip["transform"]["x"] = shift
             n_wm += 1
-            print(f"[{tag}] ВОТЕРМАРКА  x={shift:.4f}  {detail}  {os.path.basename(mat['path'])}")
+            warn = " [сдвиг 0: клип уже холста]" if shift == 0.0 else ""
+            print(f"[{tag}] ВОТЕРМАРКА  x={shift:.4f}{warn}  {detail}  {os.path.basename(mat['path'])}")
         else:
             if args.reset_clean:
                 clip["transform"]["x"] = 0.0
@@ -363,13 +413,8 @@ def main():
         print("--dry-run: файл не изменён.")
         return
 
-    backup = draft_path + time.strftime(".bak_clear_vids_%Y%m%d_%H%M%S")
-    shutil.copy2(draft_path, backup)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(draft_path), suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(draft, f, ensure_ascii=False, separators=(",", ":"))
-    os.replace(tmp, draft_path)
-    print(f"Готово. Бэкап: {backup}")
+    backup = save_draft_with_backup(draft_path, draft, prefix="clear_vids")
+    print(f"Готово. Бэкап: {backup.name}")
 
 
 if __name__ == "__main__":
