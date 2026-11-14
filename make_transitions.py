@@ -41,7 +41,8 @@ DEFAULT_DURATIONS_MAP = {
 
 def load_transition_pattern() -> tuple[dict[str, int], list[str]]:
     """Читает transitions_config.json (если есть) или возвращает настройки по умолчанию."""
-    cfg_path = Path(__file__).resolve().parent / "transitions_config.json"
+    base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    cfg_path = base_dir / "transitions_config.json"
     durations = dict(DEFAULT_DURATIONS_MAP)
     pattern = list(durations.keys())
     if cfg_path.is_file():

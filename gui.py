@@ -30,10 +30,12 @@ from capcut_common import (
     find_draft_file,
     restore_latest_backup,
 )
+import clear_vids
 import make_transitions
 import stock_fetcher
 
-APP_DIR = Path(__file__).resolve().parent
+IS_FROZEN = getattr(sys, "frozen", False)
+APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "gui_settings.json"
 SCRIPT_CLEAR = APP_DIR / "clear_vids.py"
 SCRIPT_TRANS = APP_DIR / "make_transitions.py"
@@ -607,16 +609,19 @@ class App(tk.Tk):
                 return cand
         return py
 
-    def build_cmd(self, kind, project: Path | None):
-        py = self._python_exe()
+    def _base_worker_cmd(self, kind: str, script_path: Path) -> list[str]:
+        if IS_FROZEN:
+            return [sys.executable, "--run-worker", kind]
+        return [self._python_exe(), "-u", str(script_path)]
 
+    def build_cmd(self, kind, project: Path | None):
         if kind == "stock":
             mode = self.s_mode.get()
             target = self.s_target.get().strip()
             if not target:
                 raise ValueError("Укажи ссылку, поисковый запрос или файл.")
             out_dir = self.s_output.get().strip() or str(APP_DIR / "downloads")
-            cmd = [py, "-u", str(SCRIPT_STOCK), mode, target, "-o", out_dir]
+            cmd = self._base_worker_cmd("stock", SCRIPT_STOCK) + [mode, target, "-o", out_dir]
             if mode == "yt":
                 dur = self.s_duration.get().strip() or "30"
                 int(dur)
@@ -632,14 +637,14 @@ class App(tk.Tk):
             return cmd
 
         if kind == "trans":
-            cmd = [py, "-u", str(SCRIPT_TRANS), str(project)]
+            cmd = self._base_worker_cmd("trans", SCRIPT_TRANS) + [str(project)]
             if self.t_dry.get():
                 cmd.append("--dry-run")
             if self.t_skip.get():
                 cmd.append("--skip-overlays")
             return cmd
 
-        cmd = [py, "-u", str(SCRIPT_CLEAR), str(project)]
+        cmd = self._base_worker_cmd("clear", SCRIPT_CLEAR) + [str(project)]
         scale = self.c_scale.get().strip().replace(",", ".")
         if scale:
             float(scale)
@@ -680,11 +685,12 @@ class App(tk.Tk):
                 messagebox.showerror("Проект не выбран", "Выбери папку проекта, в которой есть draft_content.json.")
                 return
 
-        script_map = {"clear": SCRIPT_CLEAR, "trans": SCRIPT_TRANS, "stock": SCRIPT_STOCK}
-        for k in kinds:
-            if not script_map[k].exists():
-                messagebox.showerror("Нет скрипта", f"Не найден файл:\n{script_map[k]}")
-                return
+        if not IS_FROZEN:
+            script_map = {"clear": SCRIPT_CLEAR, "trans": SCRIPT_TRANS, "stock": SCRIPT_STOCK}
+            for k in kinds:
+                if not script_map[k].exists():
+                    messagebox.showerror("Нет скрипта", f"Не найден файл:\n{script_map[k]}")
+                    return
 
         try:
             cmds = [(k, self.build_cmd(k, project)) for k in kinds]
@@ -803,5 +809,23 @@ class App(tk.Tk):
         self.destroy()
 
 
+def _dispatch_worker() -> bool:
+    """Точка входа для дочерних процессов при запуске собранного .exe."""
+    if len(sys.argv) >= 3 and sys.argv[1] == "--run-worker":
+        kind = sys.argv[2]
+        sys.argv = [sys.argv[0]] + sys.argv[3:]
+        if kind == "clear":
+            clear_vids.main()
+        elif kind == "trans":
+            make_transitions.main()
+        elif kind == "stock":
+            stock_fetcher.main()
+        else:
+            sys.exit(f"Неизвестный режим: {kind}")
+        return True
+    return False
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    if not _dispatch_worker():
+        App().mainloop()
