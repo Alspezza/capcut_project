@@ -111,7 +111,10 @@ def download_file_stream(url: str, dest_path: Path, headers: dict | None = None)
         last_step = -1
 
         with urllib.request.urlopen(req, timeout=60) as response:
-            total_size = int(response.headers.get("Content-Length", 0))
+            try:
+                total_size = int(response.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total_size = 0
             downloaded = 0
             print(f"[*] Скачивание: {dest_path.name}")
             with open(dest_path, "wb") as f:
@@ -253,8 +256,9 @@ def download_pexels(query: str, count: int, output_dir: Path) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ok_count = 0
+    safe_query = sanitize_filename(query, max_len=60)
     for idx, v in enumerate(videos, 1):
-        filename = sanitize_filename(f"pexels_{query}_{v['id']}_{v['width']}x{v['height']}.mp4")
+        filename = f"pexels_{safe_query}_{v['id']}_{v['width']}x{v['height']}.mp4"
         filepath = output_dir / filename
         if filepath.exists():
             print(f"[i] Уже скачано: {filename}")
@@ -307,8 +311,9 @@ def download_pixabay(query: str, count: int, output_dir: Path) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ok_count = 0
+    safe_query = sanitize_filename(query, max_len=60)
     for idx, v in enumerate(videos, 1):
-        filename = sanitize_filename(f"pixabay_{query}_{v['id']}_{v['width']}x{v['height']}.mp4")
+        filename = f"pixabay_{safe_query}_{v['id']}_{v['width']}x{v['height']}.mp4"
         filepath = output_dir / filename
         if filepath.exists():
             print(f"[i] Уже скачано: {filename}")

@@ -48,8 +48,10 @@ def load_transition_pattern() -> tuple[dict[str, int], list[str]]:
     if cfg_path.is_file():
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            if isinstance(cfg.get("durations_sec"), dict):
-                durations = {str(k): int(float(v) * 1_000_000) for k, v in cfg["durations_sec"].items()}
+            if isinstance(cfg.get("durations_sec"), dict) and cfg["durations_sec"]:
+                parsed = {str(k): int(float(v) * 1_000_000) for k, v in cfg["durations_sec"].items() if float(v) > 0}
+                if parsed:
+                    durations = parsed
             if isinstance(cfg.get("pattern"), list) and cfg["pattern"]:
                 pattern = [str(x) for x in cfg["pattern"] if str(x) in durations]
         except Exception as exc:
@@ -146,6 +148,8 @@ def apply_transitions(project, dry_run=False, skip_overlays=False,
         raise TransitionsError("CapCut запущен. Закрой его полностью (иначе он перезапишет "
                                "изменения) или запусти с --force.")
 
+    durations_map, pattern = load_transition_pattern()
+
     data = load_draft(path)
     mats = data["materials"]
     trans_list = mats.setdefault("transitions", [])
@@ -190,10 +194,10 @@ def apply_transitions(project, dry_run=False, skip_overlays=False,
             skipped += 1
             continue
 
-        effect_id = PATTERN[k % len(PATTERN)]
+        effect_id = pattern[k % len(pattern)]
         k += 1
         limit = min(s["target_timerange"]["duration"], nxt["target_timerange"]["duration"]) // 2
-        duration = min(DURATIONS_MAP[effect_id], limit)
+        duration = min(durations_map[effect_id], limit)
 
         tr = build_transition(effect_id, duration, known)
         mats["transitions"].append(tr)

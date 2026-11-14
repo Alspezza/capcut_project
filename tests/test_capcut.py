@@ -109,6 +109,24 @@ class TestCapCutCommon(unittest.TestCase):
             self.assertTrue(restored.exists())
             self.assertEqual(json.loads(draft.read_text(encoding="utf-8"))["v"], 3)
 
+    def test_pick_main_track_with_empty_video_track(self):
+        tracks = [
+            {"type": "audio", "segments": [{"id": "A1"}]},
+            {"type": "video", "segments": []},
+            {"type": "video", "segments": [{"id": "V1"}, {"id": "V2"}]},
+        ]
+        idx, tr = capcut_common.pick_main_track(tracks)
+        self.assertEqual(idx, 1)
+        self.assertEqual(len(tr["segments"]), 2)
+
+        idx0, tr0 = capcut_common.pick_main_track(tracks, index=0)
+        self.assertEqual(idx0, 0)
+        self.assertEqual(tr0["segments"], [])
+
+        idx1, tr1 = capcut_common.pick_main_track(tracks, index=1)
+        self.assertEqual(idx1, 1)
+        self.assertEqual(len(tr1["segments"]), 2)
+
 
 class TestMakeTransitions(unittest.TestCase):
     def test_apply_transitions_and_skip_overlays(self):

@@ -92,10 +92,7 @@ def pick_main_track(tracks: list, index: int | None = None) -> tuple[int, dict]:
     Выбирает видеодорожку: по явному индексу или дорожку с наибольшим числом сегментов.
     Возвращает (индекс_среди_видеодорожек, объект_дорожки).
     """
-    video = [t for t in tracks if t.get("type") == "video" and t.get("segments")]
-    if not video:
-        # Если нет дорожек с сегментами, пробуем любые видеодорожки (для корректной ошибки индекса)
-        video = [t for t in tracks if t.get("type") == "video"]
+    video = [t for t in tracks if t.get("type") == "video"]
     if not video:
         raise DraftError("В проекте нет видеодорожек.")
 

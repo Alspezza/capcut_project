@@ -776,6 +776,7 @@ class App(tk.Tk):
             self.progress.start(12)
         else:
             self.progress.stop()
+            self._update_stock_mode_ui()
 
     def _toggle_buttons(self, widget, busy):
         skip = (self.btn_stop, self.btn_stock_stop, self.btn_both, self.btn_stock_run)
