@@ -251,11 +251,47 @@ def _create_audio_segment(
     }
 
 
+def _cleanup_orphaned_materials(data: dict, candidate_ids: set[str]) -> None:
+    if not candidate_ids:
+        return
+    still_used: set[str] = set()
+    for t in data.get("tracks", []):
+        if not isinstance(t, dict):
+            continue
+        for seg in t.get("segments") or []:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("material_id"):
+                still_used.add(seg["material_id"])
+            for ref in seg.get("extra_material_refs") or []:
+                still_used.add(ref)
+
+    to_remove = candidate_ids - still_used
+    if not to_remove:
+        return
+    mats = data.get("materials") or {}
+    for key in (
+        "audios", "speeds", "placeholder_infos", "audio_fades",
+        "beats", "sound_channel_mappings", "vocal_separations",
+    ):
+        lst = mats.get(key)
+        if isinstance(lst, list):
+            mats[key] = [m for m in lst if not (isinstance(m, dict) and m.get("id") in to_remove)]
+
+
 def _find_or_create_auto_audio_track(data: dict) -> dict:
     tracks = data.setdefault("tracks", [])
     for t in tracks:
         if isinstance(t, dict) and t.get("type") == "audio" and t.get("name") == AUTO_AUDIO_TRACK_NAME:
+            old_ids: set[str] = set()
+            for seg in t.get("segments") or []:
+                if isinstance(seg, dict):
+                    if seg.get("material_id"):
+                        old_ids.add(seg["material_id"])
+                    for ref in seg.get("extra_material_refs") or []:
+                        old_ids.add(ref)
             t["segments"] = []
+            _cleanup_orphaned_materials(data, old_ids)
             return t
 
     track = {

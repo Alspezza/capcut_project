@@ -540,7 +540,7 @@ class App(tk.Tk):
             self.v_project.set(str(proj_dir))
 
     def browse_audio_file(self, var, title):
-        cur = var.get().strip()
+        cur = var.get().strip().strip('"')
         init_dir = str(Path(cur).parent) if cur and Path(cur).parent.is_dir() else str(APP_DIR)
         p = filedialog.askopenfilename(
             title=title,

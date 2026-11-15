@@ -165,3 +165,63 @@ def test_process_project_end_to_end(tmp_path):
     assert len(saved["materials"]["loudnesses"]) == 1
     assert saved["materials"]["loudnesses"][0]["enable"] is True
     assert len(saved["materials"]["material_animations"]) == 1
+
+
+def test_rerun_cleans_orphaned_materials(tmp_path):
+    draft = _make_sample_draft(video_durations=(10_000_000,))
+    intro = tmp_path / "intro.mp3"
+    ambient = tmp_path / "ambient.mp3"
+    intro.write_bytes(b"a")
+    ambient.write_bytes(b"b")
+    durations = {intro: 4_000_000, ambient: 20_000_000}
+
+    with patch("setup_audio.probe_audio_duration_us", side_effect=lambda p: durations[p]):
+        setup_audio.add_intro_and_ambient(draft, intro, ambient)
+        assert len(draft["materials"]["audios"]) == 3  # voice + intro + ambient
+        assert len(draft["materials"]["audio_fades"]) == 2
+
+        setup_audio.add_intro_and_ambient(draft, intro, ambient)
+        assert len(draft["materials"]["audios"]) == 3
+        assert len(draft["materials"]["audio_fades"]) == 2
+
+
+def test_intro_longer_than_video_skips_ambient(tmp_path):
+    draft = _make_sample_draft(video_durations=(5_000_000,))
+    intro = tmp_path / "intro.mp3"
+    ambient = tmp_path / "ambient.mp3"
+    intro.write_bytes(b"a")
+    ambient.write_bytes(b"b")
+
+    with patch("setup_audio.probe_audio_duration_us", side_effect=lambda p: 12_000_000 if p == intro else 30_000_000):
+        res = setup_audio.add_intro_and_ambient(draft, intro, ambient)
+
+    assert res["intro"] == {"start_us": 0, "duration_us": 5_000_000, "fade_in_us": 4_000_000}
+    assert res["ambient"] is None
+
+
+def test_dry_run_and_capcut_running_guard(tmp_path):
+    proj_dir = tmp_path / "Proj"
+    proj_dir.mkdir()
+    draft_file = proj_dir / "draft_content.json"
+    original = json.dumps(_make_sample_draft((6_000_000,)))
+    draft_file.write_text(original, encoding="utf-8")
+
+    with patch("setup_audio.capcut_is_running", return_value=True):
+        with pytest.raises(setup_audio.DraftError):
+            setup_audio.process_project(proj_dir, dry_run=False)
+
+        # dry_run=True не падает даже если CapCut запущен и не меняет файл
+        res = setup_audio.process_project(proj_dir, dry_run=True, normalize_voice=False)
+        assert "backup" not in res
+        assert draft_file.read_text(encoding="utf-8") == original
+
+
+def test_gui_dispatch_worker_audio(monkeypatch):
+    import sys
+    import gui
+
+    called = []
+    monkeypatch.setattr(gui.setup_audio, "main", lambda: called.append(sys.argv[:]))
+    monkeypatch.setattr(sys, "argv", ["gui.py", "--run-worker", "audio", "proj_dir", "--dry-run"])
+    assert gui._dispatch_worker() is True
+    assert called == [["gui.py", "proj_dir", "--dry-run"]]
