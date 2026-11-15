@@ -39,6 +39,7 @@ except ImportError as exc:
     clear_vids = None
     _CLEAR_VIDS_ERR = exc
 import make_transitions
+import setup_audio
 import stock_fetcher
 
 IS_FROZEN = getattr(sys, "frozen", False)
@@ -50,6 +51,7 @@ TRANSITIONS_CONFIG_FILE = CONFIG_DIR / "transitions_config.json"
 LEGACY_TRANSITIONS_CONFIG_FILE = APP_DIR / "transitions_config.json"
 SCRIPT_CLEAR = APP_DIR / "clear_vids.py"
 SCRIPT_TRANS = APP_DIR / "make_transitions.py"
+SCRIPT_AUDIO = APP_DIR / "setup_audio.py"
 SCRIPT_STOCK = APP_DIR / "stock_fetcher.py"
 IS_WIN = os.name == "nt"
 
@@ -172,6 +174,15 @@ class App(tk.Tk):
         self.c_size = tk.StringVar(value=g("c_size", ""))
         self.c_probe = tk.StringVar(value=g("c_probe", ""))
         self.c_extra = tk.StringVar(value=g("c_extra", ""))
+        # аудио + fade out
+        self.a_dry = tk.BooleanVar(value=g("a_dry", False))
+        self.a_intro = tk.StringVar(value=g("a_intro", ""))
+        self.a_ambient = tk.StringVar(value=g("a_ambient", ""))
+        self.a_voice = tk.StringVar(value=g("a_voice", "voice"))
+        self.a_db = tk.StringVar(value=g("a_db", "-7"))
+        self.a_fade = tk.StringVar(value=g("a_fade", "4"))
+        self.a_norm = tk.BooleanVar(value=g("a_norm", True))
+        self.a_vfade = tk.BooleanVar(value=g("a_vfade", True))
         # stock fetcher
         self.s_mode = tk.StringVar(value=g("s_mode", "yt"))
         self.s_target = tk.StringVar(value=g("s_target", ""))
@@ -304,11 +315,43 @@ class App(tk.Tk):
         ttk.Button(tf, text="▶  Запустить", style="Run.TButton",
                    command=lambda: self.start(["trans"])).pack(fill="x", padx=8, pady=(4, 8), side="bottom")
 
+        # --- аудио + fade out
+        af = ttk.LabelFrame(parent, text="3. Аудио (Intro / Ambient / Озвучка) + Fade Out  (setup_audio.py)")
+        af.pack(fill="x", **pad)
+        af.columnconfigure(1, weight=1)
+
+        ttk.Label(af, text="Intro:").grid(row=0, column=0, sticky="w", padx=(8, 6), pady=(6, 2))
+        ttk.Entry(af, textvariable=self.a_intro).grid(row=0, column=1, sticky="ew", pady=(6, 2))
+        ttk.Button(af, text="Обзор…", command=lambda: self.browse_audio_file(self.a_intro, "Выберите Intro")).grid(
+            row=0, column=2, padx=(6, 8), pady=(6, 2))
+
+        ttk.Label(af, text="Ambient:").grid(row=1, column=0, sticky="w", padx=(8, 6), pady=2)
+        ttk.Entry(af, textvariable=self.a_ambient).grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Button(af, text="Обзор…", command=lambda: self.browse_audio_file(self.a_ambient, "Выберите Ambient")).grid(
+            row=1, column=2, padx=(6, 8), pady=2)
+
+        arow = ttk.Frame(af)
+        arow.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        ttk.Label(arow, text="Озвучка:").pack(side="left")
+        ttk.Entry(arow, textvariable=self.a_voice, width=14).pack(side="left", padx=(4, 12))
+        ttk.Label(arow, text="Громкость, дБ:").pack(side="left")
+        ttk.Entry(arow, textvariable=self.a_db, width=6).pack(side="left", padx=(4, 12))
+        ttk.Label(arow, text="Fade, сек:").pack(side="left")
+        ttk.Entry(arow, textvariable=self.a_fade, width=5).pack(side="left", padx=(4, 12))
+        ttk.Checkbutton(arow, text="Нормализация озвучки (-23 LUFS)", variable=self.a_norm).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(arow, text="Fade Out на последнем клипе", variable=self.a_vfade).pack(side="left")
+
+        arow2 = ttk.Frame(af)
+        arow2.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 6))
+        ttk.Checkbutton(arow2, text="Пробный прогон (ничего не записывать)", variable=self.a_dry).pack(side="left")
+        ttk.Button(arow2, text="▶  Запустить", style="Run.TButton",
+                   command=lambda: self.start(["audio"])).pack(side="right")
+
         # --- общие кнопки
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=10, pady=(2, 8))
-        self.btn_both = ttk.Button(bar, text="▶▶  Запустить оба подряд (масштаб → переходы)",
-                                   style="Big.TButton", command=lambda: self.start(["clear", "trans"]))
+        self.btn_both = ttk.Button(bar, text="▶▶  Запустить всё подряд (масштаб → переходы → аудио)",
+                                   style="Big.TButton", command=lambda: self.start(["clear", "trans", "audio"]))
         self.btn_both.pack(side="left", fill="x", expand=True)
         self.btn_stop = ttk.Button(bar, text="■ Стоп", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(8, 0), ipady=8)
@@ -495,6 +538,17 @@ class App(tk.Tk):
             self.refresh_drafts(select=str(proj_dir))
         else:
             self.v_project.set(str(proj_dir))
+
+    def browse_audio_file(self, var, title):
+        cur = var.get().strip()
+        init_dir = str(Path(cur).parent) if cur and Path(cur).parent.is_dir() else str(APP_DIR)
+        p = filedialog.askopenfilename(
+            title=title,
+            initialdir=init_dir,
+            filetypes=[("Аудиофайлы", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"), ("Все файлы", "*.*")],
+        )
+        if p:
+            var.set(p)
 
     def pick_drafts_dir(self):
         d = filedialog.askdirectory(title="Папка с черновиками CapCut", initialdir=str(self.drafts_dir))
@@ -735,6 +789,37 @@ class App(tk.Tk):
                     cmd += ["--service", self.s_batch_srv.get()]
             return cmd
 
+        if kind == "audio":
+            cmd = self._base_worker_cmd("audio", SCRIPT_AUDIO) + [str(project)]
+            intro_s = self.a_intro.get().strip().strip('"')
+            ambient_s = self.a_ambient.get().strip().strip('"')
+            if intro_s:
+                cmd += ["--intro", intro_s]
+            if ambient_s:
+                cmd += ["--ambient", ambient_s]
+            voice_s = self.a_voice.get().strip()
+            if voice_s:
+                cmd += ["--voice", voice_s]
+            db_s = self.a_db.get().strip().replace(",", ".")
+            if db_s:
+                db_val = float(db_s)
+                if not math.isfinite(db_val):
+                    raise ValueError("Громкость (дБ) должна быть числом")
+                cmd += ["--db", str(db_val)]
+            fade_s = self.a_fade.get().strip().replace(",", ".")
+            if fade_s:
+                fade_val = float(fade_s)
+                if not math.isfinite(fade_val) or fade_val < 0:
+                    raise ValueError("Длительность fade должна быть >= 0")
+                cmd += ["--fade", str(fade_val)]
+            if not self.a_norm.get():
+                cmd.append("--no-norm")
+            if not self.a_vfade.get():
+                cmd.append("--no-video-fade")
+            if self.a_dry.get():
+                cmd.append("--dry-run")
+            return cmd
+
         if kind == "trans":
             cmd = self._base_worker_cmd("trans", SCRIPT_TRANS) + [str(project)]
             if self.t_dry.get():
@@ -799,7 +884,7 @@ class App(tk.Tk):
         if self.running:
             return
 
-        need_project = any(k in ("clear", "trans") for k in kinds)
+        need_project = any(k in ("clear", "trans", "audio") for k in kinds)
         project = self.current_project() if need_project else None
         if need_project:
             has_draft = False
@@ -814,7 +899,7 @@ class App(tk.Tk):
                 return
 
         if not IS_FROZEN:
-            script_map = {"clear": SCRIPT_CLEAR, "trans": SCRIPT_TRANS, "stock": SCRIPT_STOCK}
+            script_map = {"clear": SCRIPT_CLEAR, "trans": SCRIPT_TRANS, "audio": SCRIPT_AUDIO, "stock": SCRIPT_STOCK}
             for k in kinds:
                 if not script_map[k].exists():
                     messagebox.showerror("Нет скрипта", f"Не найден файл:\n{script_map[k]}")
@@ -826,7 +911,11 @@ class App(tk.Tk):
             messagebox.showerror("Неверное значение", f"Проверь заполненные поля:\n{exc}")
             return
 
-        will_write = (("clear" in kinds and not self.c_dry.get()) or ("trans" in kinds and not self.t_dry.get()))
+        will_write = (
+            ("clear" in kinds and not self.c_dry.get())
+            or ("trans" in kinds and not self.t_dry.get())
+            or ("audio" in kinds and not self.a_dry.get())
+        )
         if will_write and capcut_is_running():
             if not messagebox.askyesno(
                     "CapCut запущен",
@@ -844,7 +933,7 @@ class App(tk.Tk):
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
         flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
         ok_all = True
-        titles = {"clear": "Масштаб + вотермарка", "trans": "Переходы", "stock": "Скачивание видео"}
+        titles = {"clear": "Масштаб + вотермарка", "trans": "Переходы", "audio": "Аудио + Fade Out", "stock": "Скачивание видео"}
         for n, (kind, cmd) in enumerate(cmds, 1):
             title = titles.get(kind, kind)
             self.q.put(("line", f"\n=== {n}/{len(cmds)}: {title} ===\n", "cmd"))
@@ -937,6 +1026,9 @@ class App(tk.Tk):
             c_debug=self.c_debug.get(), c_thr=self.c_thr.get(), c_thr_single=self.c_thr_single.get(),
             c_track=self.c_track.get(), c_size=self.c_size.get(), c_probe=self.c_probe.get(),
             c_extra=self.c_extra.get(),
+            a_dry=self.a_dry.get(), a_intro=self.a_intro.get(), a_ambient=self.a_ambient.get(),
+            a_voice=self.a_voice.get(), a_db=self.a_db.get(), a_fade=self.a_fade.get(),
+            a_norm=self.a_norm.get(), a_vfade=self.a_vfade.get(),
             s_mode=self.s_mode.get(), s_target=self.s_target.get(), s_count=self.s_count.get(),
             s_duration=self.s_duration.get(), s_full=self.s_full.get(),
             s_batch_srv=self.s_batch_srv.get(), s_output=self.s_output.get(),
@@ -969,6 +1061,8 @@ def _dispatch_worker() -> bool:
             clear_vids.main()
         elif kind == "trans":
             make_transitions.main()
+        elif kind == "audio":
+            setup_audio.main()
         elif kind == "stock":
             stock_fetcher.main()
         else:
