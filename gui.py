@@ -101,7 +101,7 @@ def scan_drafts(root: Path) -> dict:
     for mtime, d in items:
         name = draft_title(d)
         stamp = time.strftime("%d.%m %H:%M", time.localtime(mtime))
-        label = f"{name}  |  {d.name}  |  {stamp}" if name else f"{d.name}  |  {stamp}"
+        label = f"{name}  |  {d.name}  |  {stamp}" if (name and name != d.name) else f"{d.name}  |  {stamp}"
         out[label] = d
     return out
 
@@ -210,10 +210,13 @@ class App(tk.Tk):
         lrow = ttk.Frame(lf)
         lrow.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Button(lrow, text="Очистить лог", command=self.clear_log).pack(side="left")
+        ttk.Button(lrow, text="Копировать лог", command=self.copy_all_log).pack(side="left", padx=(6, 0))
         self.progress = ttk.Progressbar(lrow, mode="indeterminate", length=160)
         self.progress.pack(side="right")
         self.lbl_status = ttk.Label(lrow, text="Готов")
         self.lbl_status.pack(side="right", padx=8)
+
+        self._init_log_copy()
 
     def _build_capcut_tab(self, parent, pad):
         # --- проект
@@ -633,6 +636,47 @@ class App(tk.Tk):
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
         self.log.config(state="disabled")
+
+    def _init_log_copy(self):
+        self._log_menu = tk.Menu(self.log, tearoff=0)
+        self._log_menu.add_command(label="Копировать", command=self.copy_selected_log)
+        self._log_menu.add_command(label="Выделить всё", command=self.select_all_log)
+        self._log_menu.add_separator()
+        self._log_menu.add_command(label="Копировать весь лог", command=self.copy_all_log)
+
+        self.log.bind("<Button-3>", self._show_log_menu)
+        self.log.bind("<Control-KeyPress>", self._on_log_ctrl_key)
+
+    def _show_log_menu(self, event):
+        self.log.focus_set()
+        has_sel = bool(self.log.tag_ranges("sel"))
+        self._log_menu.entryconfig("Копировать", state="normal" if has_sel else "disabled")
+        self._log_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_log_ctrl_key(self, event):
+        if event.keycode == 67 or event.keysym.lower() == "c":
+            self.copy_selected_log()
+            return "break"
+        if event.keycode == 65 or event.keysym.lower() == "a":
+            self.select_all_log()
+            return "break"
+
+    def select_all_log(self):
+        self.log.tag_add("sel", "1.0", "end-1c")
+
+    def copy_selected_log(self):
+        try:
+            text = self.log.get("sel.first", "sel.last")
+        except tk.TclError:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def copy_all_log(self):
+        text = self.log.get("1.0", "end-1c")
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
 
     def write(self, text, tag=None):
         self.log.config(state="normal")

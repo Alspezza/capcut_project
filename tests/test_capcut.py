@@ -450,6 +450,47 @@ class TestClearVids(unittest.TestCase):
             self.assertTrue((dbg / "0001_WM.jpg").is_file())
             self.assertTrue((dbg / "0002_clean.jpg").is_file())
 
+    def test_fallback_when_track_zero_is_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "proj"
+            proj.mkdir()
+            wm_vid = proj / "wm.mp4"
+            self._make_test_video(wm_vid, with_watermark=True, duration_sec=1.5, fps=10)
+
+            draft = {
+                "name": "EmptyTrack0Test",
+                "canvas_config": {"width": 1280, "height": 720},
+                "materials": {
+                    "videos": [
+                        {"id": "M0", "type": "video", "path": str(wm_vid), "width": 1280, "height": 720},
+                    ]
+                },
+                "tracks": [
+                    {"type": "video", "segments": []},
+                    {
+                        "type": "video",
+                        "segments": [
+                            {
+                                "id": "S1", "material_id": "M0",
+                                "target_timerange": {"start": 0, "duration": 1_500_000},
+                                "source_timerange": {"start": 0, "duration": 1_500_000},
+                                "clip": {"scale": {"x": 1.0, "y": 1.0}, "transform": {"x": 0.0, "y": 0.0}},
+                            },
+                        ],
+                    },
+                ],
+            }
+            dc = proj / "draft_content.json"
+            dc.write_text(json.dumps(draft), encoding="utf-8")
+
+            with mock.patch.object(sys, "argv", ["clear_vids.py", str(proj), "--force", "--scale", "1.15"]):
+                clear_vids.main()
+
+            updated = json.loads(dc.read_text(encoding="utf-8"))
+            seg = updated["tracks"][1]["segments"][0]
+            self.assertAlmostEqual(seg["clip"]["scale"]["x"], 1.15)
+            self.assertAlmostEqual(seg["clip"]["transform"]["x"], 0.15)
+
 
 class TestStockFetcher(unittest.TestCase):
     def test_helpers(self):

@@ -314,8 +314,12 @@ def main():
                 "или запусти с --force."
             )
         draft = load_draft(draft_path)
-        track_idx = 0 if args.track is None else args.track
-        idx, track = pick_main_track(draft["tracks"], track_idx)
+        if args.track is None:
+            idx, track = pick_main_track(draft["tracks"], 0)
+            if not (track.get("segments") or []):
+                idx, track = pick_main_track(draft["tracks"], None)
+        else:
+            idx, track = pick_main_track(draft["tracks"], args.track)
     except DraftError as e:
         sys.exit(f"Ошибка: {e}")
 
