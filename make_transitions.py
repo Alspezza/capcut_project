@@ -15,6 +15,7 @@ make_transitions.py — расставляет переходы по патте�
 import argparse
 import json
 import math
+import random
 import sys
 import uuid
 from pathlib import Path
@@ -153,8 +154,25 @@ def overlay_starts(tracks: list, main: dict) -> list:
 # ---------------------------------------------------------------------------
 # ОСНОВНАЯ ЛОГИКА
 # ---------------------------------------------------------------------------
-def apply_transitions(project, dry_run=False, skip_overlays=False,
-                      force=False, log=print) -> dict:
+def apply_transitions(
+    project,
+    dry_run=False,
+    skip_overlays=False,
+    force=False,
+    log=print,
+    every: int = 1,
+    chance: float = 100.0,
+    min_clip_sec: float = 0.0,
+    skip_edges: bool = False,
+    seed: int | None = None,
+) -> dict:
+    if isinstance(every, bool) or every < 1:
+        raise TransitionsError("Параметр --every должен быть целым числом >= 1.")
+    if isinstance(chance, bool) or not math.isfinite(chance) or not (0.0 <= chance <= 100.0):
+        raise TransitionsError("Параметр --chance должен быть от 0 до 100.")
+    if isinstance(min_clip_sec, bool) or not math.isfinite(min_clip_sec) or min_clip_sec < 0.0:
+        raise TransitionsError("Параметр --min-clip не может быть отрицательным.")
+
     path = find_draft_file(Path(project))
 
     if not dry_run and not force and capcut_is_running():
@@ -195,8 +213,12 @@ def apply_transitions(project, dry_run=False, skip_overlays=False,
     mats["transitions"] = [t for t in trans_list if t["id"] not in removed]
 
     # 2) ставим новые по паттерну (переход живёт на ПЕРВОМ из двух клипов стыка)
+    min_clip_us = round(min_clip_sec * 1_000_000)
+    rng = random.Random(seed) if chance < 100.0 else None
     placed = skipped = 0
+    cand_idx = 0
     k = 0
+    last_joint = len(segs) - 2
     for i, s in enumerate(segs[:-1]):
         nxt = segs[i + 1]
         end = s["target_timerange"]["start"] + s["target_timerange"]["duration"]
@@ -204,6 +226,24 @@ def apply_transitions(project, dry_run=False, skip_overlays=False,
             skipped += 1
             continue
         if any(abs(end - t) < EPS for t in skip_times):         # на стыке оверлей
+            skipped += 1
+            continue
+        if skip_edges and (i == 0 or i == last_joint):          # крайние стыки
+            skipped += 1
+            continue
+        if min_clip_us > 0 and (
+            s["target_timerange"]["duration"] < min_clip_us
+            or nxt["target_timerange"]["duration"] < min_clip_us
+        ):
+            skipped += 1
+            continue
+
+        cur_cand = cand_idx
+        cand_idx += 1
+        if every > 1 and (cur_cand % every) != 0:
+            skipped += 1
+            continue
+        if rng is not None and (rng.random() * 100.0) >= chance:
             skipped += 1
             continue
 
@@ -247,11 +287,31 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="ничего не записывать")
     ap.add_argument("--skip-overlays", action="store_true",
                     help="не ставить переход там, где на стыке начинается клип с верхней дорожки")
+    ap.add_argument("--every", type=int, default=1,
+                    help="ставить переход на каждый N-й подходящий стык (по умолч. 1 — на все)")
+    ap.add_argument("--chance", type=float, default=100.0,
+                    help="вероятность постановки перехода в %% от 0 до 100 (по умолч. 100)")
+    ap.add_argument("--min-clip", type=float, default=0.0, dest="min_clip_sec",
+                    help="минимальная длина клипа в сек для постановки перехода (по умолч. 0)")
+    ap.add_argument("--skip-edges", action="store_true",
+                    help="не ставить переход после первого и перед последним клипом")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="зерно генератора случайных чисел для --chance")
     ap.add_argument("--force", action="store_true",
                     help="не проверять, запущен ли CapCut")
     args = ap.parse_args()
     try:
-        apply_transitions(args.project, args.dry_run, args.skip_overlays, args.force)
+        apply_transitions(
+            args.project,
+            dry_run=args.dry_run,
+            skip_overlays=args.skip_overlays,
+            force=args.force,
+            every=args.every,
+            chance=args.chance,
+            min_clip_sec=args.min_clip_sec,
+            skip_edges=args.skip_edges,
+            seed=args.seed,
+        )
     except TransitionsError as e:
         sys.exit(f"Ошибка: {e}")
 

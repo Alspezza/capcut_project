@@ -108,6 +108,13 @@ class App(tk.Tk):
         self.title("CapCut Automation + Stock Fetcher")
         self.geometry("1000x760")
         self.minsize(840, 620)
+        icon_base = Path(getattr(sys, "_MEIPASS", APP_DIR))
+        icon_file = icon_base / "app_icon.ico"
+        if icon_file.is_file():
+            try:
+                self.iconbitmap(default=str(icon_file))
+            except Exception:
+                pass
 
         self.cfg = load_settings()
         saved_dir = self.cfg.get("drafts_dir", "")
@@ -142,6 +149,11 @@ class App(tk.Tk):
         # переходы
         self.t_dry = tk.BooleanVar(value=g("t_dry", False))
         self.t_skip = tk.BooleanVar(value=g("t_skip", False))
+        self.t_skip_edges = tk.BooleanVar(value=g("t_skip_edges", False))
+        self.t_every = tk.StringVar(value=g("t_every", "1"))
+        self.t_chance = tk.StringVar(value=g("t_chance", "100"))
+        self.t_min_clip = tk.StringVar(value=g("t_min_clip", "0"))
+        self.t_seed = tk.StringVar(value=g("t_seed", ""))
         # вотермарки
         self.c_dry = tk.BooleanVar(value=g("c_dry", False))
         self.c_scale = tk.StringVar(value=g("c_scale", "1.15"))
@@ -258,10 +270,26 @@ class App(tk.Tk):
         tf.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ttk.Checkbutton(tf, text="Пробный прогон (ничего не записывать)", variable=self.t_dry).pack(anchor="w", padx=8, pady=(10, 2))
         ttk.Checkbutton(tf, text="Пропускать стыки, где начинается оверлей", variable=self.t_skip).pack(anchor="w", padx=8, pady=2)
+        ttk.Checkbutton(tf, text="Не ставить после 1-го и перед последним клипом", variable=self.t_skip_edges).pack(anchor="w", padx=8, pady=2)
+
+        tadv = ttk.LabelFrame(tf, text="Параметры частоты (по умолч. = на каждый)")
+        tadv.pack(fill="x", padx=8, pady=6)
+        tfields = [
+            ("Каждый N-й стык", self.t_every, "1"),
+            ("Вероятность, %", self.t_chance, "100"),
+            ("Мин. клип, сек", self.t_min_clip, "0"),
+            ("Seed (для %)", self.t_seed, "пусто = случ."),
+        ]
+        for i, (lab, var, hint) in enumerate(tfields):
+            ttk.Label(tadv, text=lab).grid(row=i, column=0, sticky="w", padx=6, pady=2)
+            ttk.Entry(tadv, textvariable=var).grid(row=i, column=1, sticky="ew", padx=6, pady=2)
+            ttk.Label(tadv, text=hint, foreground="#999").grid(row=i, column=2, sticky="w", padx=(0, 6))
+        tadv.columnconfigure(1, weight=1)
+
         ttk.Button(tf, text="⚙ Настроить паттерн переходов…", command=self.open_transitions_editor).pack(
-            anchor="w", padx=8, pady=(8, 2))
+            anchor="w", padx=8, pady=(4, 2))
         ttk.Label(tf, text="Настройки сохраняются в transitions_config.json.",
-                  foreground="#888", justify="left").pack(anchor="w", padx=8, pady=4)
+                  foreground="#888", justify="left").pack(anchor="w", padx=8, pady=2)
         ttk.Frame(tf).pack(expand=True, fill="both")
         ttk.Button(tf, text="▶  Запустить", style="Run.TButton",
                    command=lambda: self.start(["trans"])).pack(fill="x", padx=8, pady=(4, 8), side="bottom")
@@ -652,6 +680,32 @@ class App(tk.Tk):
                 cmd.append("--dry-run")
             if self.t_skip.get():
                 cmd.append("--skip-overlays")
+            if self.t_skip_edges.get():
+                cmd.append("--skip-edges")
+            every_s = self.t_every.get().strip()
+            if every_s:
+                every = int(every_s)
+                if every < 1:
+                    raise ValueError("«Каждый N-й стык» должен быть >= 1")
+                if every != 1:
+                    cmd += ["--every", str(every)]
+            chance_s = self.t_chance.get().strip().replace(",", ".")
+            if chance_s:
+                chance = float(chance_s)
+                if not math.isfinite(chance) or not (0.0 <= chance <= 100.0):
+                    raise ValueError("Вероятность должна быть от 0 до 100%")
+                if chance != 100.0:
+                    cmd += ["--chance", str(chance)]
+            min_s = self.t_min_clip.get().strip().replace(",", ".")
+            if min_s:
+                min_clip = float(min_s)
+                if not math.isfinite(min_clip) or min_clip < 0.0:
+                    raise ValueError("Мин. длина клипа не может быть < 0")
+                if min_clip > 0.0:
+                    cmd += ["--min-clip", str(min_clip)]
+            seed_s = self.t_seed.get().strip()
+            if seed_s:
+                cmd += ["--seed", str(int(seed_s))]
             return cmd
 
         cmd = self._base_worker_cmd("clear", SCRIPT_CLEAR) + [str(project)]
@@ -813,6 +867,9 @@ class App(tk.Tk):
         self.cfg.update(
             drafts_dir=str(self.drafts_dir), last_project=str(p) if p else "",
             t_dry=self.t_dry.get(), t_skip=self.t_skip.get(),
+            t_skip_edges=self.t_skip_edges.get(), t_every=self.t_every.get(),
+            t_chance=self.t_chance.get(), t_min_clip=self.t_min_clip.get(),
+            t_seed=self.t_seed.get(),
             c_dry=self.c_dry.get(), c_scale=self.c_scale.get(), c_reset=self.c_reset.get(),
             c_debug=self.c_debug.get(), c_thr=self.c_thr.get(), c_thr_single=self.c_thr_single.get(),
             c_track=self.c_track.get(), c_size=self.c_size.get(), c_probe=self.c_probe.get(),

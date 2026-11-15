@@ -159,6 +159,64 @@ class TestMakeTransitions(unittest.TestCase):
             self.assertEqual(len(s2_refs), 1)
             self.assertEqual(s2_refs[0], updated["materials"]["transitions"][0]["id"])
 
+    def test_apply_transitions_frequency_params(self):
+        def make_5clip_draft():
+            d = make_sample_draft(with_overlay=False)
+            # 5 клипов подряд: 2s, 1s, 3s, 3s, 3s
+            durs = [2_000_000, 1_000_000, 3_000_000, 3_000_000, 3_000_000]
+            segs = []
+            cur = 0
+            for idx, dur in enumerate(durs):
+                segs.append({
+                    "id": f"S{idx + 1}",
+                    "material_id": "M1",
+                    "target_timerange": {"start": cur, "duration": dur},
+                    "extra_material_refs": [],
+                })
+                cur += dur
+            d["tracks"][0]["segments"] = segs
+            d["materials"]["transitions"] = []
+            return d
+
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "proj"
+            proj.mkdir()
+            dc = proj / "draft_content.json"
+            dc.write_text(json.dumps(make_5clip_draft()), encoding="utf-8")
+
+            # every=2 на 4 стыках -> стыки 0 и 2 (2 шт.)
+            st = make_transitions.apply_transitions(proj, dry_run=True, force=True, every=2, log=lambda *_: None)
+            self.assertEqual(st["placed"], 2)
+            self.assertEqual(st["skipped"], 2)
+
+            # skip_edges=True на 4 стыках -> остаются стыки 1 и 2 (2 шт.)
+            st = make_transitions.apply_transitions(proj, dry_run=True, force=True, skip_edges=True, log=lambda *_: None)
+            self.assertEqual(st["placed"], 2)
+            self.assertEqual(st["skipped"], 2)
+
+            # min_clip_sec=1.5 -> клип S2 (1s) отсекает стыки 0 (S1-S2) и 1 (S2-S3), остаются стыки 2 и 3 (2 шт.)
+            st = make_transitions.apply_transitions(proj, dry_run=True, force=True, min_clip_sec=1.5, log=lambda *_: None)
+            self.assertEqual(st["placed"], 2)
+            self.assertEqual(st["skipped"], 2)
+
+            # chance + seed -> воспроизводимость
+            st1 = make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=50.0, seed=42, log=lambda *_: None)
+            st2 = make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=50.0, seed=42, log=lambda *_: None)
+            self.assertEqual(st1["placed"], st2["placed"])
+
+            # chance=0 -> 0 переходов
+            st0 = make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=0.0, log=lambda *_: None)
+            self.assertEqual(st0["placed"], 0)
+            self.assertEqual(st0["skipped"], 4)
+
+            # невалидные значения
+            with self.assertRaises(make_transitions.TransitionsError):
+                make_transitions.apply_transitions(proj, dry_run=True, force=True, every=0, log=lambda *_: None)
+            with self.assertRaises(make_transitions.TransitionsError):
+                make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=120.0, log=lambda *_: None)
+            with self.assertRaises(make_transitions.TransitionsError):
+                make_transitions.apply_transitions(proj, dry_run=True, force=True, min_clip_sec=-1.0, log=lambda *_: None)
+
     def test_load_transition_pattern_partial_durations_and_rounding(self):
         with tempfile.TemporaryDirectory() as td:
             cfg_path = Path(td) / "transitions_config.json"
