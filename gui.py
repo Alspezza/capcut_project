@@ -91,13 +91,11 @@ def scan_drafts(root: Path) -> dict:
         for d in root.iterdir():
             if not d.is_dir():
                 continue
-            f = d / "draft_content.json"
-            if not f.exists() and (d / "Timelines").exists():
-                cands = sorted((d / "Timelines").glob("*/draft_info.json"))
-                if cands:
-                    f = cands[0]
-            if f.exists():
-                items.append((f.stat().st_mtime, d))
+            try:
+                f = find_draft_file(d)
+            except DraftError:
+                continue
+            items.append((f.stat().st_mtime, d))
     items.sort(reverse=True)
     out = {}
     for mtime, d in items:
@@ -760,13 +758,15 @@ class App(tk.Tk):
         need_project = any(k in ("clear", "trans") for k in kinds)
         project = self.current_project() if need_project else None
         if need_project:
-            has_draft = project and (
-                project.is_file()
-                or (project / "draft_content.json").exists()
-                or ((project / "Timelines").exists() and any((project / "Timelines").glob("*/draft_info.json")))
-            )
+            has_draft = False
+            if project:
+                try:
+                    find_draft_file(project)
+                    has_draft = True
+                except DraftError:
+                    has_draft = False
             if not has_draft:
-                messagebox.showerror("Проект не выбран", "Выбери папку проекта, в которой есть draft_content.json.")
+                messagebox.showerror("Проект не выбран", "Выбери папку проекта, в которой есть draft_content.json или draft_info.json.")
                 return
 
         if not IS_FROZEN:

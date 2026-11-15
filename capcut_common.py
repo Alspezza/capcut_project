@@ -28,7 +28,7 @@ def _has_drafts(root: Path) -> bool:
         for d in root.iterdir():
             if not d.is_dir():
                 continue
-            if (d / "draft_content.json").is_file():
+            if (d / "draft_content.json").is_file() or (d / "draft_info.json").is_file():
                 return True
             timelines = d / "Timelines"
             if timelines.is_dir() and any(timelines.glob("*/draft_info.json")):
@@ -100,15 +100,16 @@ def capcut_is_running() -> bool:
 
 
 def find_draft_file(project: Path | str) -> Path:
-    """Ищет файл таймлайна: сам файл, draft_content.json или Timelines/*/draft_info.json."""
+    """Ищет файл таймлайна: сам файл, draft_content.json, draft_info.json или Timelines/*/draft_info.json."""
     if not str(project).strip():
         raise DraftError("Путь к проекту не указан.")
     p = Path(project)
     if p.is_file():
         return p
-    direct = p / "draft_content.json"
-    if direct.is_file():
-        return direct
+    for name in ("draft_content.json", "draft_info.json"):
+        direct = p / name
+        if direct.is_file():
+            return direct
     timelines = p / "Timelines"
     if timelines.is_dir():
         cands = sorted(timelines.glob("*/draft_info.json"))

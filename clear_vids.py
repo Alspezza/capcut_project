@@ -42,7 +42,7 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -367,15 +367,21 @@ def main():
 
     workers = max(1, args.workers)
     if workers > 1 and len(unique_tasks) > 1:
+        total_u = len(unique_tasks)
+        print(f"Параллельный анализ уникальных клипов: {total_u} шт. ({min(workers, total_u)} потоков)...", flush=True)
+
         def _run_one(item):
             k, (m, s, tg) = item
-            return k, detect_watermark(
+            return k, os.path.basename(m["path"]), detect_watermark(
                 m, s, marks, stack_thr, args.threshold_single, args.margin, args.probe_times,
                 args.debug_dir, tg, {})
 
-        with ThreadPoolExecutor(max_workers=min(workers, len(unique_tasks))) as pool:
-            for k, res in pool.map(_run_one, unique_tasks.items()):
+        with ThreadPoolExecutor(max_workers=min(workers, total_u)) as pool:
+            futures = [pool.submit(_run_one, item) for item in unique_tasks.items()]
+            for done_idx, fut in enumerate(as_completed(futures), 1):
+                k, fname, res = fut.result()
                 cache[k] = res
+                print(f"  [анализ {done_idx}/{total_u}] {fname}", flush=True)
 
     for tag, seg, mat in active_items:
         found, results = detect_watermark(

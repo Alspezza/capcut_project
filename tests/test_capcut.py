@@ -91,6 +91,12 @@ class TestCapCutCommon(unittest.TestCase):
             di.write_text('{"ok": 2}', encoding="utf-8")
             self.assertEqual(capcut_common.find_draft_file(p2), di)
 
+            p3 = root / "proj3"
+            p3.mkdir()
+            di_root = p3 / "draft_info.json"
+            di_root.write_text('{"ok": 3}', encoding="utf-8")
+            self.assertEqual(capcut_common.find_draft_file(p3), di_root)
+
             bad = p1 / "bad.json"
             bad.write_bytes(b"\x00\xff\xfeencrypted")
             with self.assertRaises(capcut_common.DraftError):
