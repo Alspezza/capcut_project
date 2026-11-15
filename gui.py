@@ -26,6 +26,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from capcut_common import (
     DraftError,
+    app_config_dir,
     capcut_is_running,
     default_drafts_dir,
     find_draft_file,
@@ -42,7 +43,11 @@ import stock_fetcher
 
 IS_FROZEN = getattr(sys, "frozen", False)
 APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
-SETTINGS_FILE = APP_DIR / "gui_settings.json"
+CONFIG_DIR = app_config_dir()
+SETTINGS_FILE = CONFIG_DIR / "gui_settings.json"
+LEGACY_SETTINGS_FILE = APP_DIR / "gui_settings.json"
+TRANSITIONS_CONFIG_FILE = CONFIG_DIR / "transitions_config.json"
+LEGACY_TRANSITIONS_CONFIG_FILE = APP_DIR / "transitions_config.json"
 SCRIPT_CLEAR = APP_DIR / "clear_vids.py"
 SCRIPT_TRANS = APP_DIR / "make_transitions.py"
 SCRIPT_STOCK = APP_DIR / "stock_fetcher.py"
@@ -53,14 +58,18 @@ IS_WIN = os.name == "nt"
 # Вспомогательное
 # ---------------------------------------------------------------------------
 def load_settings() -> dict:
-    try:
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    for path in (SETTINGS_FILE, LEGACY_SETTINGS_FILE):
+        if path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+    return {}
 
 
 def save_settings(data: dict) -> None:
     try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -473,8 +482,18 @@ class App(tk.Tk):
 
     def browse_project(self):
         d = filedialog.askdirectory(title="Папка проекта CapCut", initialdir=str(self.drafts_dir))
-        if d:
-            self.v_project.set(str(Path(d)))
+        if not d:
+            return
+        p = Path(d)
+        if p.is_file():
+            proj_dir = p.parent.parent.parent if p.parent.parent.name == "Timelines" else p.parent
+        else:
+            proj_dir = p
+        if proj_dir.parent.is_dir():
+            self.drafts_dir = proj_dir.parent
+            self.refresh_drafts(select=str(proj_dir))
+        else:
+            self.v_project.set(str(proj_dir))
 
     def pick_drafts_dir(self):
         d = filedialog.askdirectory(title="Папка с черновиками CapCut", initialdir=str(self.drafts_dir))
@@ -567,9 +586,9 @@ class App(tk.Tk):
                 redraw()
 
         def on_reset():
-            cfg_path = APP_DIR / "transitions_config.json"
-            if cfg_path.exists():
-                cfg_path.unlink()
+            for cfg_path in (TRANSITIONS_CONFIG_FILE, LEGACY_TRANSITIONS_CONFIG_FILE):
+                if cfg_path.exists():
+                    cfg_path.unlink()
             win.destroy()
             self.write("\nСброшен transitions_config.json к значениям по умолчанию.\n", "ok")
 
@@ -589,8 +608,8 @@ class App(tk.Tk):
             except ValueError as exc:
                 messagebox.showerror("Ошибка", str(exc), parent=win)
                 return
-            cfg_path = APP_DIR / "transitions_config.json"
-            cfg_path.write_text(
+            TRANSITIONS_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TRANSITIONS_CONFIG_FILE.write_text(
                 json.dumps({"durations_sec": new_durs, "pattern": new_pat}, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )

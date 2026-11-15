@@ -22,6 +22,7 @@ from pathlib import Path
 
 from capcut_common import (
     DraftError as TransitionsError,
+    app_config_dir,
     capcut_is_running,
     default_cache_effect_dir,
     find_draft_file,
@@ -35,7 +36,8 @@ from capcut_common import (
 # ---------------------------------------------------------------------------
 DEFAULT_DURATIONS_MAP = {
     "7159450506648097281": int(1.0 * 1000000),  # Размытие шаром (1с)
-    "7140916992118100482": int(1.0 * 1000000),  # Вертикальное размытие (1с)
+    "7140916992118100482": int(1.0 * 1000000),  # Vertical Blur / Размытие по вертикали (1с)
+    "7291574063514784257": int(0.5 * 1000000),  # Vertical Blur II (0.5с)
     "7184693655641264641": int(0.9 * 1000000),  # Шестиугольный зум (0.9с)
     "7140916996262072833": int(0.8 * 1000000),  # Горизонтальное размытие (0.8с)
 }
@@ -43,8 +45,12 @@ DEFAULT_DURATIONS_MAP = {
 
 def load_transition_pattern() -> tuple[dict[str, int], list[str]]:
     """Читает transitions_config.json (если есть) или возвращает настройки по умолчанию."""
-    base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-    cfg_path = base_dir / "transitions_config.json"
+    cfg_path = app_config_dir() / "transitions_config.json"
+    if not cfg_path.is_file():
+        base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+        legacy_path = base_dir / "transitions_config.json"
+        if legacy_path.is_file():
+            cfg_path = legacy_path
     durations = dict(DEFAULT_DURATIONS_MAP)
     pattern = list(durations.keys())
     if cfg_path.is_file():
@@ -90,8 +96,12 @@ FALLBACK_TEMPLATES = {
         "path": _effect_path("7159450506648097281", "10478b300821fa6eccadf67b07b63208"),
     },
     "7140916992118100482": {
-        "name": "Размытие по вертикали", "is_overlap": False,
+        "name": "Размытие по вертикали (Vertical Blur)", "is_overlap": False,
         "path": _effect_path("7140916992118100482", "f55306a27ff8e0a8ae29584bb661ad73"),
+    },
+    "7291574063514784257": {
+        "name": "Vertical Blur II", "is_overlap": True,
+        "path": _effect_path("7291574063514784257", "85e381982a94778e003f3acc9527d5cf"),
     },
     "7184693655641264641": {
         "name": "Шестиугольный зум", "is_overlap": False,
@@ -166,7 +176,7 @@ def apply_transitions(
     skip_edges: bool = False,
     seed: int | None = None,
 ) -> dict:
-    if isinstance(every, bool) or every < 1:
+    if isinstance(every, bool) or not isinstance(every, int) or every < 1:
         raise TransitionsError("Параметр --every должен быть целым числом >= 1.")
     if isinstance(chance, bool) or not math.isfinite(chance) or not (0.0 <= chance <= 100.0):
         raise TransitionsError("Параметр --chance должен быть от 0 до 100.")

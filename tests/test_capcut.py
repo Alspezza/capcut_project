@@ -4,6 +4,7 @@
 
 import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -135,6 +136,34 @@ class TestCapCutCommon(unittest.TestCase):
         with self.assertRaises(capcut_common.DraftError):
             capcut_common.find_draft_file("   ")
 
+    def test_default_drafts_dir_prefers_non_empty_and_app_config_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            empty_dir = root / "empty"
+            empty_dir.mkdir()
+            self.assertFalse(capcut_common._has_drafts(empty_dir))
+
+            pop_dir = root / "populated"
+            proj = pop_dir / "proj1"
+            proj.mkdir(parents=True)
+            (proj / "draft_content.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(capcut_common._has_drafts(pop_dir))
+
+            local_app = root / "LocalAppData"
+            (local_app / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(local_app), "APPDATA": str(root / "Roaming")}):
+                with mock.patch.object(
+                    capcut_common, "_has_drafts", side_effect=lambda p: str(p) == r"D:\Capcut\CapCut Drafts"
+                ):
+                    self.assertEqual(capcut_common.default_drafts_dir(), Path(r"D:\Capcut\CapCut Drafts"))
+
+                with mock.patch.object(capcut_common, "IS_WIN", True):
+                    cfg_dir = capcut_common.app_config_dir()
+                    self.assertEqual(cfg_dir, root / "Roaming" / "CapCutAutomation")
+                    self.assertFalse(cfg_dir.exists())
+                    created = capcut_common.app_config_dir(create=True)
+                    self.assertTrue(created.is_dir())
+
 
 class TestMakeTransitions(unittest.TestCase):
     def test_apply_transitions_and_skip_overlays(self):
@@ -213,6 +242,8 @@ class TestMakeTransitions(unittest.TestCase):
             with self.assertRaises(make_transitions.TransitionsError):
                 make_transitions.apply_transitions(proj, dry_run=True, force=True, every=0, log=lambda *_: None)
             with self.assertRaises(make_transitions.TransitionsError):
+                make_transitions.apply_transitions(proj, dry_run=True, force=True, every=1.5, log=lambda *_: None)
+            with self.assertRaises(make_transitions.TransitionsError):
                 make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=120.0, log=lambda *_: None)
             with self.assertRaises(make_transitions.TransitionsError):
                 make_transitions.apply_transitions(proj, dry_run=True, force=True, min_clip_sec=-1.0, log=lambda *_: None)
@@ -230,9 +261,10 @@ class TestMakeTransitions(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_file = Path(td) / "make_transitions.py"
-            with mock.patch.object(make_transitions, "__file__", str(fake_file)):
-                with mock.patch.object(sys, "frozen", False, create=True):
-                    durs, pat = make_transitions.load_transition_pattern()
+            with mock.patch.object(make_transitions, "app_config_dir", return_value=Path(td) / "appdata"):
+                with mock.patch.object(make_transitions, "__file__", str(fake_file)):
+                    with mock.patch.object(sys, "frozen", False, create=True):
+                        durs, pat = make_transitions.load_transition_pattern()
             self.assertEqual(durs["7159450506648097281"], 290_000)
             self.assertEqual(durs["7140916992118100482"], 1_150_000)
             self.assertEqual(pat, ["7159450506648097281", "7140916992118100482"])
