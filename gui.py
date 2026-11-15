@@ -26,6 +26,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from capcut_common import (
     DraftError,
+    app_config_dir,
     capcut_is_running,
     default_drafts_dir,
     find_draft_file,
@@ -38,13 +39,19 @@ except ImportError as exc:
     clear_vids = None
     _CLEAR_VIDS_ERR = exc
 import make_transitions
+import setup_audio
 import stock_fetcher
 
 IS_FROZEN = getattr(sys, "frozen", False)
 APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
-SETTINGS_FILE = APP_DIR / "gui_settings.json"
+CONFIG_DIR = app_config_dir()
+SETTINGS_FILE = CONFIG_DIR / "gui_settings.json"
+LEGACY_SETTINGS_FILE = APP_DIR / "gui_settings.json"
+TRANSITIONS_CONFIG_FILE = CONFIG_DIR / "transitions_config.json"
+LEGACY_TRANSITIONS_CONFIG_FILE = APP_DIR / "transitions_config.json"
 SCRIPT_CLEAR = APP_DIR / "clear_vids.py"
 SCRIPT_TRANS = APP_DIR / "make_transitions.py"
+SCRIPT_AUDIO = APP_DIR / "setup_audio.py"
 SCRIPT_STOCK = APP_DIR / "stock_fetcher.py"
 IS_WIN = os.name == "nt"
 
@@ -53,14 +60,18 @@ IS_WIN = os.name == "nt"
 # Вспомогательное
 # ---------------------------------------------------------------------------
 def load_settings() -> dict:
-    try:
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    for path in (SETTINGS_FILE, LEGACY_SETTINGS_FILE):
+        if path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+    return {}
 
 
 def save_settings(data: dict) -> None:
     try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -82,19 +93,17 @@ def scan_drafts(root: Path) -> dict:
         for d in root.iterdir():
             if not d.is_dir():
                 continue
-            f = d / "draft_content.json"
-            if not f.exists() and (d / "Timelines").exists():
-                cands = sorted((d / "Timelines").glob("*/draft_info.json"))
-                if cands:
-                    f = cands[0]
-            if f.exists():
-                items.append((f.stat().st_mtime, d))
+            try:
+                f = find_draft_file(d)
+            except DraftError:
+                continue
+            items.append((f.stat().st_mtime, d))
     items.sort(reverse=True)
     out = {}
     for mtime, d in items:
         name = draft_title(d)
         stamp = time.strftime("%d.%m %H:%M", time.localtime(mtime))
-        label = f"{name}  |  {d.name}  |  {stamp}" if name else f"{d.name}  |  {stamp}"
+        label = f"{name}  |  {d.name}  |  {stamp}" if (name and name != d.name) else f"{d.name}  |  {stamp}"
         out[label] = d
     return out
 
@@ -108,6 +117,13 @@ class App(tk.Tk):
         self.title("CapCut Automation + Stock Fetcher")
         self.geometry("1000x760")
         self.minsize(840, 620)
+        icon_base = Path(getattr(sys, "_MEIPASS", APP_DIR))
+        icon_file = icon_base / "app_icon.ico"
+        if icon_file.is_file():
+            try:
+                self.iconbitmap(default=str(icon_file))
+            except Exception:
+                pass
 
         self.cfg = load_settings()
         saved_dir = self.cfg.get("drafts_dir", "")
@@ -142,6 +158,11 @@ class App(tk.Tk):
         # переходы
         self.t_dry = tk.BooleanVar(value=g("t_dry", False))
         self.t_skip = tk.BooleanVar(value=g("t_skip", False))
+        self.t_skip_edges = tk.BooleanVar(value=g("t_skip_edges", False))
+        self.t_every = tk.StringVar(value=g("t_every", "1"))
+        self.t_chance = tk.StringVar(value=g("t_chance", "100"))
+        self.t_min_clip = tk.StringVar(value=g("t_min_clip", "0"))
+        self.t_seed = tk.StringVar(value=g("t_seed", ""))
         # вотермарки
         self.c_dry = tk.BooleanVar(value=g("c_dry", False))
         self.c_scale = tk.StringVar(value=g("c_scale", "1.15"))
@@ -153,6 +174,15 @@ class App(tk.Tk):
         self.c_size = tk.StringVar(value=g("c_size", ""))
         self.c_probe = tk.StringVar(value=g("c_probe", ""))
         self.c_extra = tk.StringVar(value=g("c_extra", ""))
+        # аудио + fade out
+        self.a_dry = tk.BooleanVar(value=g("a_dry", False))
+        self.a_intro = tk.StringVar(value=g("a_intro", ""))
+        self.a_ambient = tk.StringVar(value=g("a_ambient", ""))
+        self.a_voice = tk.StringVar(value=g("a_voice", "voice"))
+        self.a_db = tk.StringVar(value=g("a_db", "-7"))
+        self.a_fade = tk.StringVar(value=g("a_fade", "4"))
+        self.a_norm = tk.BooleanVar(value=g("a_norm", True))
+        self.a_vfade = tk.BooleanVar(value=g("a_vfade", True))
         # stock fetcher
         self.s_mode = tk.StringVar(value=g("s_mode", "yt"))
         self.s_target = tk.StringVar(value=g("s_target", ""))
@@ -191,10 +221,13 @@ class App(tk.Tk):
         lrow = ttk.Frame(lf)
         lrow.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Button(lrow, text="Очистить лог", command=self.clear_log).pack(side="left")
+        ttk.Button(lrow, text="Копировать лог", command=self.copy_all_log).pack(side="left", padx=(6, 0))
         self.progress = ttk.Progressbar(lrow, mode="indeterminate", length=160)
         self.progress.pack(side="right")
         self.lbl_status = ttk.Label(lrow, text="Готов")
         self.lbl_status.pack(side="right", padx=8)
+
+        self._init_log_copy()
 
     def _build_capcut_tab(self, parent, pad):
         # --- проект
@@ -258,19 +291,67 @@ class App(tk.Tk):
         tf.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ttk.Checkbutton(tf, text="Пробный прогон (ничего не записывать)", variable=self.t_dry).pack(anchor="w", padx=8, pady=(10, 2))
         ttk.Checkbutton(tf, text="Пропускать стыки, где начинается оверлей", variable=self.t_skip).pack(anchor="w", padx=8, pady=2)
+        ttk.Checkbutton(tf, text="Не ставить после 1-го и перед последним клипом", variable=self.t_skip_edges).pack(anchor="w", padx=8, pady=2)
+
+        tadv = ttk.LabelFrame(tf, text="Параметры частоты (по умолч. = на каждый)")
+        tadv.pack(fill="x", padx=8, pady=6)
+        tfields = [
+            ("Каждый N-й стык", self.t_every, "1"),
+            ("Вероятность, %", self.t_chance, "100"),
+            ("Мин. клип, сек", self.t_min_clip, "0"),
+            ("Seed (для %)", self.t_seed, "пусто = случ."),
+        ]
+        for i, (lab, var, hint) in enumerate(tfields):
+            ttk.Label(tadv, text=lab).grid(row=i, column=0, sticky="w", padx=6, pady=2)
+            ttk.Entry(tadv, textvariable=var).grid(row=i, column=1, sticky="ew", padx=6, pady=2)
+            ttk.Label(tadv, text=hint, foreground="#999").grid(row=i, column=2, sticky="w", padx=(0, 6))
+        tadv.columnconfigure(1, weight=1)
+
         ttk.Button(tf, text="⚙ Настроить паттерн переходов…", command=self.open_transitions_editor).pack(
-            anchor="w", padx=8, pady=(8, 2))
+            anchor="w", padx=8, pady=(4, 2))
         ttk.Label(tf, text="Настройки сохраняются в transitions_config.json.",
-                  foreground="#888", justify="left").pack(anchor="w", padx=8, pady=4)
+                  foreground="#888", justify="left").pack(anchor="w", padx=8, pady=2)
         ttk.Frame(tf).pack(expand=True, fill="both")
         ttk.Button(tf, text="▶  Запустить", style="Run.TButton",
                    command=lambda: self.start(["trans"])).pack(fill="x", padx=8, pady=(4, 8), side="bottom")
 
+        # --- аудио + fade out
+        af = ttk.LabelFrame(parent, text="3. Аудио (Intro / Ambient / Озвучка) + Fade Out  (setup_audio.py)")
+        af.pack(fill="x", **pad)
+        af.columnconfigure(1, weight=1)
+
+        ttk.Label(af, text="Intro:").grid(row=0, column=0, sticky="w", padx=(8, 6), pady=(6, 2))
+        ttk.Entry(af, textvariable=self.a_intro).grid(row=0, column=1, sticky="ew", pady=(6, 2))
+        ttk.Button(af, text="Обзор…", command=lambda: self.browse_audio_file(self.a_intro, "Выберите Intro")).grid(
+            row=0, column=2, padx=(6, 8), pady=(6, 2))
+
+        ttk.Label(af, text="Ambient:").grid(row=1, column=0, sticky="w", padx=(8, 6), pady=2)
+        ttk.Entry(af, textvariable=self.a_ambient).grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Button(af, text="Обзор…", command=lambda: self.browse_audio_file(self.a_ambient, "Выберите Ambient")).grid(
+            row=1, column=2, padx=(6, 8), pady=2)
+
+        arow = ttk.Frame(af)
+        arow.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        ttk.Label(arow, text="Озвучка:").pack(side="left")
+        ttk.Entry(arow, textvariable=self.a_voice, width=14).pack(side="left", padx=(4, 12))
+        ttk.Label(arow, text="Громкость, дБ:").pack(side="left")
+        ttk.Entry(arow, textvariable=self.a_db, width=6).pack(side="left", padx=(4, 12))
+        ttk.Label(arow, text="Fade, сек:").pack(side="left")
+        ttk.Entry(arow, textvariable=self.a_fade, width=5).pack(side="left", padx=(4, 12))
+        ttk.Checkbutton(arow, text="Нормализация озвучки (-23 LUFS)", variable=self.a_norm).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(arow, text="Fade Out на последнем клипе", variable=self.a_vfade).pack(side="left")
+
+        arow2 = ttk.Frame(af)
+        arow2.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 6))
+        ttk.Checkbutton(arow2, text="Пробный прогон (ничего не записывать)", variable=self.a_dry).pack(side="left")
+        ttk.Button(arow2, text="▶  Запустить", style="Run.TButton",
+                   command=lambda: self.start(["audio"])).pack(side="right")
+
         # --- общие кнопки
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=10, pady=(2, 8))
-        self.btn_both = ttk.Button(bar, text="▶▶  Запустить оба подряд (масштаб → переходы)",
-                                   style="Big.TButton", command=lambda: self.start(["clear", "trans"]))
+        self.btn_both = ttk.Button(bar, text="▶▶  Запустить всё подряд (масштаб → переходы → аудио)",
+                                   style="Big.TButton", command=lambda: self.start(["clear", "trans", "audio"]))
         self.btn_both.pack(side="left", fill="x", expand=True)
         self.btn_stop = ttk.Button(bar, text="■ Стоп", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(8, 0), ipady=8)
@@ -445,8 +526,29 @@ class App(tk.Tk):
 
     def browse_project(self):
         d = filedialog.askdirectory(title="Папка проекта CapCut", initialdir=str(self.drafts_dir))
-        if d:
-            self.v_project.set(str(Path(d)))
+        if not d:
+            return
+        p = Path(d)
+        if p.is_file():
+            proj_dir = p.parent.parent.parent if p.parent.parent.name == "Timelines" else p.parent
+        else:
+            proj_dir = p
+        if proj_dir.parent.is_dir():
+            self.drafts_dir = proj_dir.parent
+            self.refresh_drafts(select=str(proj_dir))
+        else:
+            self.v_project.set(str(proj_dir))
+
+    def browse_audio_file(self, var, title):
+        cur = var.get().strip().strip('"')
+        init_dir = str(Path(cur).parent) if cur and Path(cur).parent.is_dir() else str(APP_DIR)
+        p = filedialog.askopenfilename(
+            title=title,
+            initialdir=init_dir,
+            filetypes=[("Аудиофайлы", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"), ("Все файлы", "*.*")],
+        )
+        if p:
+            var.set(p)
 
     def pick_drafts_dir(self):
         d = filedialog.askdirectory(title="Папка с черновиками CapCut", initialdir=str(self.drafts_dir))
@@ -539,9 +641,9 @@ class App(tk.Tk):
                 redraw()
 
         def on_reset():
-            cfg_path = APP_DIR / "transitions_config.json"
-            if cfg_path.exists():
-                cfg_path.unlink()
+            for cfg_path in (TRANSITIONS_CONFIG_FILE, LEGACY_TRANSITIONS_CONFIG_FILE):
+                if cfg_path.exists():
+                    cfg_path.unlink()
             win.destroy()
             self.write("\nСброшен transitions_config.json к значениям по умолчанию.\n", "ok")
 
@@ -561,8 +663,8 @@ class App(tk.Tk):
             except ValueError as exc:
                 messagebox.showerror("Ошибка", str(exc), parent=win)
                 return
-            cfg_path = APP_DIR / "transitions_config.json"
-            cfg_path.write_text(
+            TRANSITIONS_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TRANSITIONS_CONFIG_FILE.write_text(
                 json.dumps({"durations_sec": new_durs, "pattern": new_pat}, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
@@ -588,6 +690,47 @@ class App(tk.Tk):
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
         self.log.config(state="disabled")
+
+    def _init_log_copy(self):
+        self._log_menu = tk.Menu(self.log, tearoff=0)
+        self._log_menu.add_command(label="Копировать", command=self.copy_selected_log)
+        self._log_menu.add_command(label="Выделить всё", command=self.select_all_log)
+        self._log_menu.add_separator()
+        self._log_menu.add_command(label="Копировать весь лог", command=self.copy_all_log)
+
+        self.log.bind("<Button-3>", self._show_log_menu)
+        self.log.bind("<Control-KeyPress>", self._on_log_ctrl_key)
+
+    def _show_log_menu(self, event):
+        self.log.focus_set()
+        has_sel = bool(self.log.tag_ranges("sel"))
+        self._log_menu.entryconfig("Копировать", state="normal" if has_sel else "disabled")
+        self._log_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_log_ctrl_key(self, event):
+        if event.keycode == 67 or event.keysym.lower() == "c":
+            self.copy_selected_log()
+            return "break"
+        if event.keycode == 65 or event.keysym.lower() == "a":
+            self.select_all_log()
+            return "break"
+
+    def select_all_log(self):
+        self.log.tag_add("sel", "1.0", "end-1c")
+
+    def copy_selected_log(self):
+        try:
+            text = self.log.get("sel.first", "sel.last")
+        except tk.TclError:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def copy_all_log(self):
+        text = self.log.get("1.0", "end-1c")
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
 
     def write(self, text, tag=None):
         self.log.config(state="normal")
@@ -646,12 +789,69 @@ class App(tk.Tk):
                     cmd += ["--service", self.s_batch_srv.get()]
             return cmd
 
+        if kind == "audio":
+            cmd = self._base_worker_cmd("audio", SCRIPT_AUDIO) + [str(project)]
+            intro_s = self.a_intro.get().strip().strip('"')
+            ambient_s = self.a_ambient.get().strip().strip('"')
+            if intro_s:
+                cmd += ["--intro", intro_s]
+            if ambient_s:
+                cmd += ["--ambient", ambient_s]
+            voice_s = self.a_voice.get().strip()
+            if voice_s:
+                cmd += ["--voice", voice_s]
+            db_s = self.a_db.get().strip().replace(",", ".")
+            if db_s:
+                db_val = float(db_s)
+                if not math.isfinite(db_val):
+                    raise ValueError("Громкость (дБ) должна быть числом")
+                cmd += ["--db", str(db_val)]
+            fade_s = self.a_fade.get().strip().replace(",", ".")
+            if fade_s:
+                fade_val = float(fade_s)
+                if not math.isfinite(fade_val) or fade_val < 0:
+                    raise ValueError("Длительность fade должна быть >= 0")
+                cmd += ["--fade", str(fade_val)]
+            if not self.a_norm.get():
+                cmd.append("--no-norm")
+            if not self.a_vfade.get():
+                cmd.append("--no-video-fade")
+            if self.a_dry.get():
+                cmd.append("--dry-run")
+            return cmd
+
         if kind == "trans":
             cmd = self._base_worker_cmd("trans", SCRIPT_TRANS) + [str(project)]
             if self.t_dry.get():
                 cmd.append("--dry-run")
             if self.t_skip.get():
                 cmd.append("--skip-overlays")
+            if self.t_skip_edges.get():
+                cmd.append("--skip-edges")
+            every_s = self.t_every.get().strip()
+            if every_s:
+                every = int(every_s)
+                if every < 1:
+                    raise ValueError("«Каждый N-й стык» должен быть >= 1")
+                if every != 1:
+                    cmd += ["--every", str(every)]
+            chance_s = self.t_chance.get().strip().replace(",", ".")
+            if chance_s:
+                chance = float(chance_s)
+                if not math.isfinite(chance) or not (0.0 <= chance <= 100.0):
+                    raise ValueError("Вероятность должна быть от 0 до 100%")
+                if chance != 100.0:
+                    cmd += ["--chance", str(chance)]
+            min_s = self.t_min_clip.get().strip().replace(",", ".")
+            if min_s:
+                min_clip = float(min_s)
+                if not math.isfinite(min_clip) or min_clip < 0.0:
+                    raise ValueError("Мин. длина клипа не может быть < 0")
+                if min_clip > 0.0:
+                    cmd += ["--min-clip", str(min_clip)]
+            seed_s = self.t_seed.get().strip()
+            if seed_s:
+                cmd += ["--seed", str(int(seed_s))]
             return cmd
 
         cmd = self._base_worker_cmd("clear", SCRIPT_CLEAR) + [str(project)]
@@ -684,20 +884,22 @@ class App(tk.Tk):
         if self.running:
             return
 
-        need_project = any(k in ("clear", "trans") for k in kinds)
+        need_project = any(k in ("clear", "trans", "audio") for k in kinds)
         project = self.current_project() if need_project else None
         if need_project:
-            has_draft = project and (
-                project.is_file()
-                or (project / "draft_content.json").exists()
-                or ((project / "Timelines").exists() and any((project / "Timelines").glob("*/draft_info.json")))
-            )
+            has_draft = False
+            if project:
+                try:
+                    find_draft_file(project)
+                    has_draft = True
+                except DraftError:
+                    has_draft = False
             if not has_draft:
-                messagebox.showerror("Проект не выбран", "Выбери папку проекта, в которой есть draft_content.json.")
+                messagebox.showerror("Проект не выбран", "Выбери папку проекта, в которой есть draft_content.json или draft_info.json.")
                 return
 
         if not IS_FROZEN:
-            script_map = {"clear": SCRIPT_CLEAR, "trans": SCRIPT_TRANS, "stock": SCRIPT_STOCK}
+            script_map = {"clear": SCRIPT_CLEAR, "trans": SCRIPT_TRANS, "audio": SCRIPT_AUDIO, "stock": SCRIPT_STOCK}
             for k in kinds:
                 if not script_map[k].exists():
                     messagebox.showerror("Нет скрипта", f"Не найден файл:\n{script_map[k]}")
@@ -709,7 +911,11 @@ class App(tk.Tk):
             messagebox.showerror("Неверное значение", f"Проверь заполненные поля:\n{exc}")
             return
 
-        will_write = (("clear" in kinds and not self.c_dry.get()) or ("trans" in kinds and not self.t_dry.get()))
+        will_write = (
+            ("clear" in kinds and not self.c_dry.get())
+            or ("trans" in kinds and not self.t_dry.get())
+            or ("audio" in kinds and not self.a_dry.get())
+        )
         if will_write and capcut_is_running():
             if not messagebox.askyesno(
                     "CapCut запущен",
@@ -727,7 +933,7 @@ class App(tk.Tk):
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
         flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
         ok_all = True
-        titles = {"clear": "Масштаб + вотермарка", "trans": "Переходы", "stock": "Скачивание видео"}
+        titles = {"clear": "Масштаб + вотермарка", "trans": "Переходы", "audio": "Аудио + Fade Out", "stock": "Скачивание видео"}
         for n, (kind, cmd) in enumerate(cmds, 1):
             title = titles.get(kind, kind)
             self.q.put(("line", f"\n=== {n}/{len(cmds)}: {title} ===\n", "cmd"))
@@ -813,10 +1019,16 @@ class App(tk.Tk):
         self.cfg.update(
             drafts_dir=str(self.drafts_dir), last_project=str(p) if p else "",
             t_dry=self.t_dry.get(), t_skip=self.t_skip.get(),
+            t_skip_edges=self.t_skip_edges.get(), t_every=self.t_every.get(),
+            t_chance=self.t_chance.get(), t_min_clip=self.t_min_clip.get(),
+            t_seed=self.t_seed.get(),
             c_dry=self.c_dry.get(), c_scale=self.c_scale.get(), c_reset=self.c_reset.get(),
             c_debug=self.c_debug.get(), c_thr=self.c_thr.get(), c_thr_single=self.c_thr_single.get(),
             c_track=self.c_track.get(), c_size=self.c_size.get(), c_probe=self.c_probe.get(),
             c_extra=self.c_extra.get(),
+            a_dry=self.a_dry.get(), a_intro=self.a_intro.get(), a_ambient=self.a_ambient.get(),
+            a_voice=self.a_voice.get(), a_db=self.a_db.get(), a_fade=self.a_fade.get(),
+            a_norm=self.a_norm.get(), a_vfade=self.a_vfade.get(),
             s_mode=self.s_mode.get(), s_target=self.s_target.get(), s_count=self.s_count.get(),
             s_duration=self.s_duration.get(), s_full=self.s_full.get(),
             s_batch_srv=self.s_batch_srv.get(), s_output=self.s_output.get(),
@@ -849,6 +1061,8 @@ def _dispatch_worker() -> bool:
             clear_vids.main()
         elif kind == "trans":
             make_transitions.main()
+        elif kind == "audio":
+            setup_audio.main()
         elif kind == "stock":
             stock_fetcher.main()
         else:

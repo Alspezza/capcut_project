@@ -30,9 +30,19 @@ python make_transitions.py --help
 python stock_fetcher.py --help
 ```
 
+## Сборка `.exe` (PyInstaller)
+
+Конфигурация сборки с иконкой зафиксирована в `CapCutAutomation.spec`:
+
+```bash
+pyinstaller CapCutAutomation.spec
+```
+
+Готовый файл появится в `dist/CapCutAutomation.exe`. Настройки GUI (`gui_settings.json`) и паттерн переходов (`transitions_config.json`) сохраняются в `%APPDATA%\CapCutAutomation`.
+
 ## Настройка переходов
 
-По умолчанию паттерн переходов задан в `make_transitions.py`. Для переопределения без правки кода можно создать рядом файл `transitions_config.json`:
+По умолчанию паттерн переходов задан в `make_transitions.py`. Для переопределения без правки кода можно создать файл `transitions_config.json` в `%APPDATA%\CapCutAutomation` (или рядом со скриптом):
 
 ```json
 {

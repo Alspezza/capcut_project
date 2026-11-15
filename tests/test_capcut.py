@@ -4,6 +4,7 @@
 
 import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -90,6 +91,12 @@ class TestCapCutCommon(unittest.TestCase):
             di.write_text('{"ok": 2}', encoding="utf-8")
             self.assertEqual(capcut_common.find_draft_file(p2), di)
 
+            p3 = root / "proj3"
+            p3.mkdir()
+            di_root = p3 / "draft_info.json"
+            di_root.write_text('{"ok": 3}', encoding="utf-8")
+            self.assertEqual(capcut_common.find_draft_file(p3), di_root)
+
             bad = p1 / "bad.json"
             bad.write_bytes(b"\x00\xff\xfeencrypted")
             with self.assertRaises(capcut_common.DraftError):
@@ -135,6 +142,34 @@ class TestCapCutCommon(unittest.TestCase):
         with self.assertRaises(capcut_common.DraftError):
             capcut_common.find_draft_file("   ")
 
+    def test_default_drafts_dir_prefers_non_empty_and_app_config_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            empty_dir = root / "empty"
+            empty_dir.mkdir()
+            self.assertFalse(capcut_common._has_drafts(empty_dir))
+
+            pop_dir = root / "populated"
+            proj = pop_dir / "proj1"
+            proj.mkdir(parents=True)
+            (proj / "draft_content.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(capcut_common._has_drafts(pop_dir))
+
+            local_app = root / "LocalAppData"
+            (local_app / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(local_app), "APPDATA": str(root / "Roaming")}):
+                with mock.patch.object(
+                    capcut_common, "_has_drafts", side_effect=lambda p: str(p) == r"D:\Capcut\CapCut Drafts"
+                ):
+                    self.assertEqual(capcut_common.default_drafts_dir(), Path(r"D:\Capcut\CapCut Drafts"))
+
+                with mock.patch.object(capcut_common, "IS_WIN", True):
+                    cfg_dir = capcut_common.app_config_dir()
+                    self.assertEqual(cfg_dir, root / "Roaming" / "CapCutAutomation")
+                    self.assertFalse(cfg_dir.exists())
+                    created = capcut_common.app_config_dir(create=True)
+                    self.assertTrue(created.is_dir())
+
 
 class TestMakeTransitions(unittest.TestCase):
     def test_apply_transitions_and_skip_overlays(self):
@@ -159,6 +194,66 @@ class TestMakeTransitions(unittest.TestCase):
             self.assertEqual(len(s2_refs), 1)
             self.assertEqual(s2_refs[0], updated["materials"]["transitions"][0]["id"])
 
+    def test_apply_transitions_frequency_params(self):
+        def make_5clip_draft():
+            d = make_sample_draft(with_overlay=False)
+            # 5 клипов подряд: 2s, 1s, 3s, 3s, 3s
+            durs = [2_000_000, 1_000_000, 3_000_000, 3_000_000, 3_000_000]
+            segs = []
+            cur = 0
+            for idx, dur in enumerate(durs):
+                segs.append({
+                    "id": f"S{idx + 1}",
+                    "material_id": "M1",
+                    "target_timerange": {"start": cur, "duration": dur},
+                    "extra_material_refs": [],
+                })
+                cur += dur
+            d["tracks"][0]["segments"] = segs
+            d["materials"]["transitions"] = []
+            return d
+
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "proj"
+            proj.mkdir()
+            dc = proj / "draft_content.json"
+            dc.write_text(json.dumps(make_5clip_draft()), encoding="utf-8")
+
+            # every=2 на 4 стыках -> стыки 0 и 2 (2 шт.)
+            st = make_transitions.apply_transitions(proj, dry_run=True, force=True, every=2, log=lambda *_: None)
+            self.assertEqual(st["placed"], 2)
+            self.assertEqual(st["skipped"], 2)
+
+            # skip_edges=True на 4 стыках -> остаются стыки 1 и 2 (2 шт.)
+            st = make_transitions.apply_transitions(proj, dry_run=True, force=True, skip_edges=True, log=lambda *_: None)
+            self.assertEqual(st["placed"], 2)
+            self.assertEqual(st["skipped"], 2)
+
+            # min_clip_sec=1.5 -> клип S2 (1s) отсекает стыки 0 (S1-S2) и 1 (S2-S3), остаются стыки 2 и 3 (2 шт.)
+            st = make_transitions.apply_transitions(proj, dry_run=True, force=True, min_clip_sec=1.5, log=lambda *_: None)
+            self.assertEqual(st["placed"], 2)
+            self.assertEqual(st["skipped"], 2)
+
+            # chance + seed -> воспроизводимость
+            st1 = make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=50.0, seed=42, log=lambda *_: None)
+            st2 = make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=50.0, seed=42, log=lambda *_: None)
+            self.assertEqual(st1["placed"], st2["placed"])
+
+            # chance=0 -> 0 переходов
+            st0 = make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=0.0, log=lambda *_: None)
+            self.assertEqual(st0["placed"], 0)
+            self.assertEqual(st0["skipped"], 4)
+
+            # невалидные значения
+            with self.assertRaises(make_transitions.TransitionsError):
+                make_transitions.apply_transitions(proj, dry_run=True, force=True, every=0, log=lambda *_: None)
+            with self.assertRaises(make_transitions.TransitionsError):
+                make_transitions.apply_transitions(proj, dry_run=True, force=True, every=1.5, log=lambda *_: None)
+            with self.assertRaises(make_transitions.TransitionsError):
+                make_transitions.apply_transitions(proj, dry_run=True, force=True, chance=120.0, log=lambda *_: None)
+            with self.assertRaises(make_transitions.TransitionsError):
+                make_transitions.apply_transitions(proj, dry_run=True, force=True, min_clip_sec=-1.0, log=lambda *_: None)
+
     def test_load_transition_pattern_partial_durations_and_rounding(self):
         with tempfile.TemporaryDirectory() as td:
             cfg_path = Path(td) / "transitions_config.json"
@@ -172,9 +267,10 @@ class TestMakeTransitions(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_file = Path(td) / "make_transitions.py"
-            with mock.patch.object(make_transitions, "__file__", str(fake_file)):
-                with mock.patch.object(sys, "frozen", False, create=True):
-                    durs, pat = make_transitions.load_transition_pattern()
+            with mock.patch.object(make_transitions, "app_config_dir", return_value=Path(td) / "appdata"):
+                with mock.patch.object(make_transitions, "__file__", str(fake_file)):
+                    with mock.patch.object(sys, "frozen", False, create=True):
+                        durs, pat = make_transitions.load_transition_pattern()
             self.assertEqual(durs["7159450506648097281"], 290_000)
             self.assertEqual(durs["7140916992118100482"], 1_150_000)
             self.assertEqual(pat, ["7159450506648097281", "7140916992118100482"])
@@ -353,6 +449,47 @@ class TestClearVids(unittest.TestCase):
             self.assertAlmostEqual(s2["clip"]["transform"]["x"], 0.0)
             self.assertTrue((dbg / "0001_WM.jpg").is_file())
             self.assertTrue((dbg / "0002_clean.jpg").is_file())
+
+    def test_fallback_when_track_zero_is_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "proj"
+            proj.mkdir()
+            wm_vid = proj / "wm.mp4"
+            self._make_test_video(wm_vid, with_watermark=True, duration_sec=1.5, fps=10)
+
+            draft = {
+                "name": "EmptyTrack0Test",
+                "canvas_config": {"width": 1280, "height": 720},
+                "materials": {
+                    "videos": [
+                        {"id": "M0", "type": "video", "path": str(wm_vid), "width": 1280, "height": 720},
+                    ]
+                },
+                "tracks": [
+                    {"type": "video", "segments": []},
+                    {
+                        "type": "video",
+                        "segments": [
+                            {
+                                "id": "S1", "material_id": "M0",
+                                "target_timerange": {"start": 0, "duration": 1_500_000},
+                                "source_timerange": {"start": 0, "duration": 1_500_000},
+                                "clip": {"scale": {"x": 1.0, "y": 1.0}, "transform": {"x": 0.0, "y": 0.0}},
+                            },
+                        ],
+                    },
+                ],
+            }
+            dc = proj / "draft_content.json"
+            dc.write_text(json.dumps(draft), encoding="utf-8")
+
+            with mock.patch.object(sys, "argv", ["clear_vids.py", str(proj), "--force", "--scale", "1.15"]):
+                clear_vids.main()
+
+            updated = json.loads(dc.read_text(encoding="utf-8"))
+            seg = updated["tracks"][1]["segments"][0]
+            self.assertAlmostEqual(seg["clip"]["scale"]["x"], 1.15)
+            self.assertAlmostEqual(seg["clip"]["transform"]["x"], 0.15)
 
 
 class TestStockFetcher(unittest.TestCase):

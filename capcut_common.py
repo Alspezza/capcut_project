@@ -20,17 +20,57 @@ class DraftError(Exception):
     """Понятная ошибка для пользователя (CLI печатает её, GUI может показать)."""
 
 
+def _has_drafts(root: Path) -> bool:
+    """True, если в папке root есть хотя бы один проект CapCut."""
+    if not root.is_dir():
+        return False
+    try:
+        for d in root.iterdir():
+            if not d.is_dir():
+                continue
+            if (d / "draft_content.json").is_file() or (d / "draft_info.json").is_file():
+                return True
+            timelines = d / "Timelines"
+            if timelines.is_dir() and any(timelines.glob("*/draft_info.json")):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def default_drafts_dir() -> Path:
     """Возвращает папку черновиков CapCut по умолчанию для текущего пользователя."""
-    preferred = Path(r"D:\Для работы\CapCut Drafts")
-    if preferred.is_dir():
-        return preferred
+    candidates = [
+        Path(r"D:\Для работы\CapCut Drafts"),
+        Path(r"D:\Capcut\CapCut Drafts"),
+    ]
     local_app = os.environ.get("LOCALAPPDATA")
     if local_app:
-        cand = Path(local_app) / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft"
+        candidates.append(Path(local_app) / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft")
+    home_drafts = Path.home() / "CapCut Drafts"
+    candidates.append(home_drafts)
+
+    for cand in candidates:
+        if _has_drafts(cand):
+            return cand
+    for cand in candidates:
         if cand.is_dir():
             return cand
-    return Path.home() / "CapCut Drafts"
+    return home_drafts
+
+
+def app_config_dir(create: bool = False) -> Path:
+    """Возвращает папку конфигурации приложения (%APPDATA%\\CapCutAutomation на Windows)."""
+    if IS_WIN:
+        app_data = os.environ.get("APPDATA")
+        base = Path(app_data) if app_data else (Path.home() / "AppData" / "Roaming")
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else (Path.home() / ".config")
+    cfg_dir = base / "CapCutAutomation"
+    if create:
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+    return cfg_dir
 
 
 def default_cache_effect_dir() -> Path:
@@ -60,15 +100,16 @@ def capcut_is_running() -> bool:
 
 
 def find_draft_file(project: Path | str) -> Path:
-    """Ищет файл таймлайна: сам файл, draft_content.json или Timelines/*/draft_info.json."""
+    """Ищет файл таймлайна: сам файл, draft_content.json, draft_info.json или Timelines/*/draft_info.json."""
     if not str(project).strip():
         raise DraftError("Путь к проекту не указан.")
     p = Path(project)
     if p.is_file():
         return p
-    direct = p / "draft_content.json"
-    if direct.is_file():
-        return direct
+    for name in ("draft_content.json", "draft_info.json"):
+        direct = p / name
+        if direct.is_file():
+            return direct
     timelines = p / "Timelines"
     if timelines.is_dir():
         cands = sorted(timelines.glob("*/draft_info.json"))

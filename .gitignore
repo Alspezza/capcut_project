@@ -4,9 +4,9 @@ __pycache__/
 *.pyc
 build/
 dist/
-*.spec
 debug/
 downloads/
 gui_settings.json
 stock_config.json
 transitions_config.json
+.vscode/
