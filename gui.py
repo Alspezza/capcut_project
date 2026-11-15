@@ -111,12 +111,88 @@ def scan_drafts(root: Path) -> dict:
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
+class PlaceholderEntry(ttk.Entry):
+    """Поле ввода с серой подсказкой: видна, пока поле пустое, исчезает при фокусе."""
+
+    _HINT_COLOR = "#8c8c8c"
+
+    def __init__(self, master, variable: tk.StringVar, placeholder: str, **kwargs):
+        super().__init__(master, **kwargs)
+        self.var = variable
+        self.placeholder = placeholder
+        self._hint_visible = False
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<KeyRelease>", self._push_to_var)
+        self.var.trace_add("write", self._on_var_changed)
+        self._render(self.var.get())
+
+    def _render(self, value: str) -> None:
+        self._hint_visible = not value
+        self.configure(foreground=self._HINT_COLOR if self._hint_visible else "")
+        self.delete(0, "end")
+        self.insert(0, value or self.placeholder)
+
+    def _on_focus_in(self, _event=None) -> None:
+        if self._hint_visible:
+            self._hint_visible = False
+            self.configure(foreground="")
+            self.delete(0, "end")
+
+    def _push_to_var(self, _event=None) -> None:
+        if not self._hint_visible:
+            self.var.set(self.get().strip())
+
+    def _on_focus_out(self, _event=None) -> None:
+        if self._hint_visible:
+            return
+        self._push_to_var()
+        if not self.var.get():
+            self._render("")
+
+    def _on_var_changed(self, *_args) -> None:
+        value = self.var.get()
+        current = "" if self._hint_visible else self.get().strip()
+        if value != current:
+            self._render(value)
+
+    def commit(self) -> None:
+        """Переносит введённое значение в переменную (даже если фокус ещё в поле)."""
+        if not self._hint_visible:
+            self._push_to_var()
+
+
 class App(tk.Tk):
+    def _window_geometry(self):
+        """Размер и позиция окна в пределах рабочей области (без панели задач)."""
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            rect = wintypes.RECT()
+            # SPI_GETWORKAREA = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                area_w = rect.right - rect.left
+                area_h = rect.bottom - rect.top
+                # оставляем место под заголовок окна и рамки
+                win_w = min(1000, area_w - 30)
+                win_h = min(980, area_h - 50)
+                x = rect.left + max(0, (area_w - win_w - 16) // 2)
+                y = rect.top + max(0, (area_h - win_h - 39) // 2)
+                return win_w, win_h, x, y
+        except Exception:
+            pass
+        win_w = min(1000, screen_w - 40)
+        win_h = min(980, screen_h - 120)
+        return win_w, win_h, 40, 40
+
     def __init__(self):
         super().__init__()
         self.title("CapCut Automation + Stock Fetcher")
-        self.geometry("1000x760")
-        self.minsize(840, 620)
+        win_w, win_h, win_x, win_y = self._window_geometry()
+        self.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
+        self.minsize(840, 700)
         icon_base = Path(getattr(sys, "_MEIPASS", APP_DIR))
         icon_file = icon_base / "app_icon.ico"
         if icon_file.is_file():
@@ -178,11 +254,10 @@ class App(tk.Tk):
         self.a_dry = tk.BooleanVar(value=g("a_dry", False))
         self.a_intro = tk.StringVar(value=g("a_intro", ""))
         self.a_ambient = tk.StringVar(value=g("a_ambient", ""))
+        self.a_prompts = tk.StringVar(value=g("a_prompts", ""))
+        self.a_markers = tk.StringVar(value=g("a_markers", ""))
+        self.a_anchor_prompt = tk.StringVar(value=g("a_anchor_prompt", ""))
         self.a_voice = tk.StringVar(value=g("a_voice", "voice"))
-        self.a_db = tk.StringVar(value=g("a_db", "-7"))
-        self.a_fade = tk.StringVar(value=g("a_fade", "4"))
-        self.a_norm = tk.BooleanVar(value=g("a_norm", True))
-        self.a_vfade = tk.BooleanVar(value=g("a_vfade", True))
         # stock fetcher
         self.s_mode = tk.StringVar(value=g("s_mode", "yt"))
         self.s_target = tk.StringVar(value=g("s_target", ""))
@@ -204,7 +279,15 @@ class App(tk.Tk):
         self.notebook.add(tab_capcut, text="  🎬 Обработка проекта (CapCut)  ")
         self.notebook.add(tab_stock, text="  📥 Скачать видео (Stock Fetcher)  ")
 
-        self._build_capcut_tab(tab_capcut, pad)
+        # Нижняя панель с общими кнопками не прокручивается — она всегда на виду.
+        bar_holder = ttk.Frame(tab_capcut)
+        bar_holder.pack(side="bottom", fill="x")
+        scroll_holder = ttk.Frame(tab_capcut)
+        scroll_holder.pack(side="top", fill="both", expand=True)
+
+        capcut_inner = self._make_scrollable_tab(scroll_holder)
+        self._build_capcut_tab(capcut_inner, pad)
+        self._build_capcut_bar(bar_holder)
         self._build_stock_tab(tab_stock, pad)
 
         # --- общий лог
@@ -228,6 +311,47 @@ class App(tk.Tk):
         self.lbl_status.pack(side="right", padx=8)
 
         self._init_log_copy()
+
+    def _make_scrollable_tab(self, parent) -> ttk.Frame:
+        """Оборачивает содержимое вкладки в прокручиваемую область (на случай нехватки высоты)."""
+        canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0, height=620)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def fit_height(_event=None):
+            # вкладка занимает ровно столько, сколько нужно, оставляя место логу
+            win_h = self.winfo_height()
+            if win_h <= 1:
+                win_h = self.winfo_screenheight() - 80
+            cap = max(320, win_h - 240)
+            canvas.configure(height=min(max(inner.winfo_reqheight(), 200), cap))
+
+        def on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            fit_height()
+
+        inner.bind("<Configure>", on_inner_configure)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        self.bind("<Configure>", lambda e: fit_height() if e.widget is self else None)
+
+        def on_wheel(event):
+            widget = self.winfo_containing(event.x_root, event.y_root)
+            while widget is not None and widget is not inner:
+                widget = getattr(widget, "master", None)
+            if widget is None:
+                return None
+            if inner.winfo_reqheight() <= canvas.winfo_height():
+                return None
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        self.bind("<MouseWheel>", on_wheel, add="+")
+        return inner
 
     def _build_capcut_tab(self, parent, pad):
         # --- проект
@@ -316,7 +440,7 @@ class App(tk.Tk):
                    command=lambda: self.start(["trans"])).pack(fill="x", padx=8, pady=(4, 8), side="bottom")
 
         # --- аудио + fade out
-        af = ttk.LabelFrame(parent, text="3. Аудио (Intro / Ambient / Озвучка) + Fade Out  (setup_audio.py)")
+        af = ttk.LabelFrame(parent, text="3. Аудио: Intro → Ambient по сценарию  (−7 дБ, хвост 6 с, Fade Out/In 4.5/3 с)")
         af.pack(fill="x", **pad)
         af.columnconfigure(1, weight=1)
 
@@ -330,29 +454,40 @@ class App(tk.Tk):
         ttk.Button(af, text="Обзор…", command=lambda: self.browse_audio_file(self.a_ambient, "Выберите Ambient")).grid(
             row=1, column=2, padx=(6, 8), pady=2)
 
-        arow = ttk.Frame(af)
-        arow.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
-        ttk.Label(arow, text="Озвучка:").pack(side="left")
-        ttk.Entry(arow, textvariable=self.a_voice, width=14).pack(side="left", padx=(4, 12))
-        ttk.Label(arow, text="Громкость, дБ:").pack(side="left")
-        ttk.Entry(arow, textvariable=self.a_db, width=6).pack(side="left", padx=(4, 12))
-        ttk.Label(arow, text="Fade, сек:").pack(side="left")
-        ttk.Entry(arow, textvariable=self.a_fade, width=5).pack(side="left", padx=(4, 12))
-        ttk.Checkbutton(arow, text="Нормализация озвучки (-23 LUFS)", variable=self.a_norm).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(arow, text="Fade Out на последнем клипе", variable=self.a_vfade).pack(side="left")
+        ttk.Label(af, text="Промпты кадров:").grid(row=2, column=0, sticky="w", padx=(8, 6), pady=2)
+        self.e_prompts = PlaceholderEntry(
+            af, self.a_prompts,
+            "путь к .txt с промптами кадров и сценарием в [скобках]",
+        )
+        self.e_prompts.grid(row=2, column=1, sticky="ew", pady=2)
+        ttk.Button(af, text="Обзор…", command=self.browse_prompts_file).grid(
+            row=2, column=2, padx=(6, 8), pady=2)
 
-        arow2 = ttk.Frame(af)
-        arow2.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 6))
-        ttk.Checkbutton(arow2, text="Пробный прогон (ничего не записывать)", variable=self.a_dry).pack(side="left")
-        ttk.Button(arow2, text="▶  Запустить", style="Run.TButton",
-                   command=lambda: self.start(["audio"])).pack(side="right")
+        prow = ttk.Frame(af)
+        prow.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        ttk.Label(prow, text="Маркер конца интро:").pack(side="left")
+        self.e_markers = PlaceholderEntry(
+            prow, self.a_markers,
+            "по умолчанию: начнём с / начинаем",
+            width=30,
+        )
+        self.e_markers.pack(side="left", padx=(4, 12), fill="x", expand=True)
+        ttk.Label(prow, text="Кадр №:").pack(side="left")
+        self.e_anchor = PlaceholderEntry(prow, self.a_anchor_prompt, "авто", width=7)
+        self.e_anchor.pack(side="left", padx=(4, 12))
+        ttk.Label(prow, text="Озвучка:").pack(side="left")
+        ttk.Entry(prow, textvariable=self.a_voice, width=12).pack(side="left", padx=(4, 12))
+        ttk.Checkbutton(prow, text="Пробный прогон", variable=self.a_dry).pack(side="left")
 
-        # --- общие кнопки
+    def _build_capcut_bar(self, parent):
+        """Общие кнопки вкладки — вне прокручиваемой области, видны всегда."""
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=10, pady=(2, 8))
         self.btn_both = ttk.Button(bar, text="▶▶  Запустить всё подряд (масштаб → переходы → аудио)",
                                    style="Big.TButton", command=lambda: self.start(["clear", "trans", "audio"]))
         self.btn_both.pack(side="left", fill="x", expand=True)
+        self.btn_audio = ttk.Button(bar, text="▶  Только аудио", command=lambda: self.start(["audio"]))
+        self.btn_audio.pack(side="left", padx=(8, 0))
         self.btn_stop = ttk.Button(bar, text="■ Стоп", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(8, 0), ipady=8)
 
@@ -549,6 +684,17 @@ class App(tk.Tk):
         )
         if p:
             var.set(p)
+
+    def browse_prompts_file(self):
+        cur = self.a_prompts.get().strip().strip('"')
+        init_dir = str(Path(cur).parent) if cur and Path(cur).parent.is_dir() else str(APP_DIR)
+        p = filedialog.askopenfilename(
+            title="Выберите файл промптов кадров (.txt)",
+            initialdir=init_dir,
+            filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")],
+        )
+        if p:
+            self.a_prompts.set(p)
 
     def pick_drafts_dir(self):
         d = filedialog.askdirectory(title="Папка с черновиками CapCut", initialdir=str(self.drafts_dir))
@@ -790,6 +936,8 @@ class App(tk.Tk):
             return cmd
 
         if kind == "audio":
+            for widget in (self.e_prompts, self.e_markers, self.e_anchor):
+                widget.commit()
             cmd = self._base_worker_cmd("audio", SCRIPT_AUDIO) + [str(project)]
             intro_s = self.a_intro.get().strip().strip('"')
             ambient_s = self.a_ambient.get().strip().strip('"')
@@ -797,25 +945,24 @@ class App(tk.Tk):
                 cmd += ["--intro", intro_s]
             if ambient_s:
                 cmd += ["--ambient", ambient_s]
+            prompts_s = self.a_prompts.get().strip().strip('"')
+            if prompts_s:
+                cmd += ["--prompts", prompts_s]
+            markers_s = self.a_markers.get().strip()
+            if markers_s:
+                cmd += ["--anchor-markers", markers_s]
+            anchor_s = self.a_anchor_prompt.get().strip()
+            if anchor_s:
+                try:
+                    anchor_val = int(anchor_s)
+                except ValueError:
+                    raise ValueError("«Кадр №» должен быть целым числом")
+                if anchor_val < 1:
+                    raise ValueError("«Кадр №» должен быть >= 1")
+                cmd += ["--anchor-prompt", str(anchor_val)]
             voice_s = self.a_voice.get().strip()
             if voice_s:
                 cmd += ["--voice", voice_s]
-            db_s = self.a_db.get().strip().replace(",", ".")
-            if db_s:
-                db_val = float(db_s)
-                if not math.isfinite(db_val):
-                    raise ValueError("Громкость (дБ) должна быть числом")
-                cmd += ["--db", str(db_val)]
-            fade_s = self.a_fade.get().strip().replace(",", ".")
-            if fade_s:
-                fade_val = float(fade_s)
-                if not math.isfinite(fade_val) or fade_val < 0:
-                    raise ValueError("Длительность fade должна быть >= 0")
-                cmd += ["--fade", str(fade_val)]
-            if not self.a_norm.get():
-                cmd.append("--no-norm")
-            if not self.a_vfade.get():
-                cmd.append("--no-video-fade")
             if self.a_dry.get():
                 cmd.append("--dry-run")
             return cmd
@@ -1016,6 +1163,8 @@ class App(tk.Tk):
     # ---- настройки -------------------------------------------------------
     def save_all(self):
         p = self.current_project()
+        for widget in (self.e_prompts, self.e_markers, self.e_anchor):
+            widget.commit()
         self.cfg.update(
             drafts_dir=str(self.drafts_dir), last_project=str(p) if p else "",
             t_dry=self.t_dry.get(), t_skip=self.t_skip.get(),
@@ -1027,12 +1176,16 @@ class App(tk.Tk):
             c_track=self.c_track.get(), c_size=self.c_size.get(), c_probe=self.c_probe.get(),
             c_extra=self.c_extra.get(),
             a_dry=self.a_dry.get(), a_intro=self.a_intro.get(), a_ambient=self.a_ambient.get(),
-            a_voice=self.a_voice.get(), a_db=self.a_db.get(), a_fade=self.a_fade.get(),
-            a_norm=self.a_norm.get(), a_vfade=self.a_vfade.get(),
+            a_prompts=self.a_prompts.get(), a_markers=self.a_markers.get(),
+            a_anchor_prompt=self.a_anchor_prompt.get(), a_voice=self.a_voice.get(),
             s_mode=self.s_mode.get(), s_target=self.s_target.get(), s_count=self.s_count.get(),
             s_duration=self.s_duration.get(), s_full=self.s_full.get(),
             s_batch_srv=self.s_batch_srv.get(), s_output=self.s_output.get(),
         )
+        # параметры, которые теперь заданы в коде и убраны из интерфейса
+        for stale in ("a_intro_tail", "a_intro_fade_out", "a_ambient_fade_in",
+                      "a_db", "a_fade", "a_norm", "a_vfade"):
+            self.cfg.pop(stale, None)
         save_settings(self.cfg)
 
     def on_close(self):

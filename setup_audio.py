@@ -2,8 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 setup_audio.py — автоматическая настройка аудио и финального Fade Out в проекте CapCut:
-  1. Добавляет intro (с 00:00, fade in 4 сек) и ambient (сразу после intro, обрезка по видео, fade out 4 сек),
-     громкость -7 дБ для обоих.
+  1. Добавляет intro и ambient, громкость -7 дБ для обоих.
+     Конец intro выравнивается по кадру видео, в сценарии которого звучит фраза-маркер
+     («начнём с…», «начинаем…» и т. п.). Файл промптов кадров — обычный .txt вида
+     «[PROMPT #N] <описание кадра> [<фрагмент сценария>]»; номер промпта связывается с
+     клипом видео <N>.mp4 на основной дорожке проекта. Хвост intro (последние 6 сек)
+     не используется — там плохой звук.
+     Переход intro → ambient: Fade Out у intro 4.5 сек, Fade In у ambient 3 сек.
   2. Включает нормализацию звука (materials.loudnesses, -23 LUFS) на дорожке озвучки (по умолчанию 'voice').
   3. Добавляет анимацию Fade Out (4 сек) на последний видеоклип основной дорожки.
 """
@@ -29,6 +34,20 @@ from capcut_common import (
 AUTO_AUDIO_TRACK_NAME = "CapCutAutomation Audio"
 FADE_OUT_EFFECT_ID = "6798320902548230669"
 FADE_OUT_FALLBACK_HASH = "c6f05ce62355b537be762550040bfc08"
+
+# Интро: последние 6 сек не используем (плохой звук), переход в ambient — 4.5 / 3 сек.
+INTRO_TAIL_TRIM_US = 6_000_000
+INTRO_FADE_OUT_US = 4_500_000
+AMBIENT_FADE_IN_US = 3_000_000
+# Максимальное замедление интро, если оно короче кадра-якоря (0.25 = в 4 раза медленнее).
+MIN_INTRO_SPEED = 0.25
+
+# Фразы-маркеры конца интро во фрагментах сценария.
+# «начнём», «начнем», «начинаем» — но НЕ «начинается», «начинал», «начинают».
+DEFAULT_ANCHOR_MARKERS = r"\bнач(?:нём|нем|инаем)\b"
+
+_PROMPT_HEADER_RE = re.compile(r"\[\s*PROMPT\s*#\s*(\d+)\s*\]", re.IGNORECASE)
+_SCRIPT_BLOCK_RE = re.compile(r"\[([^\[\]]+)\]")
 
 _SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
@@ -170,13 +189,19 @@ def _create_audio_segment(
     volume_linear: float,
     fade_in_us: int = 0,
     fade_out_us: int = 0,
+    source_start_us: int = 0,
+    source_duration_us: int | None = None,
+    speed: float = 1.0,
 ) -> dict:
     audio_mat = _make_audio_material(path, full_duration_us)
     _ensure_material_list(mats, "audios").append(audio_mat)
 
+    speed = float(speed)
+    source_dur = target_duration_us if source_duration_us is None else max(0, int(source_duration_us))
+
     speed_id = _uid()
     _ensure_material_list(mats, "speeds").append({
-        "id": speed_id, "type": "speed", "mode": 0, "speed": 1.0, "curve_speed": None,
+        "id": speed_id, "type": "speed", "mode": 0, "speed": speed, "curve_speed": None,
     })
 
     placeholder_id = _uid()
@@ -218,12 +243,12 @@ def _create_audio_segment(
     return {
         "id": _uid(),
         "material_id": audio_mat["id"],
-        "source_timerange": {"start": 0, "duration": target_duration_us},
+        "source_timerange": {"start": max(0, int(source_start_us)), "duration": source_dur},
         "target_timerange": {"start": target_start_us, "duration": target_duration_us},
         "render_timerange": {"start": 0, "duration": 0},
         "desc": "",
         "state": 0,
-        "speed": 1.0,
+        "speed": speed,
         "is_loop": False,
         "is_tone_modify": False,
         "reverse": False,
@@ -307,57 +332,330 @@ def _find_or_create_auto_audio_track(data: dict) -> dict:
     return track
 
 
+def parse_prompt_scripts(path: Path) -> list[tuple[int, str]]:
+    """
+    Читает файл промптов кадров и возвращает [(номер_промпта, фрагмент_сценария), ...].
+
+    Формат файла:
+        [PROMPT #1]
+        <описание кадра>
+        [<фрагмент сценария>]
+    """
+    if not path.is_file():
+        raise DraftError(f"Файл промптов не найден: {path}")
+
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    headers = list(_PROMPT_HEADER_RE.finditer(text))
+    if not headers:
+        raise DraftError(
+            f"В файле {path.name} не найдено ни одного блока [PROMPT #N]. "
+            "Нужен файл промптов кадров со сценарием в [...] под каждым промптом."
+        )
+
+    out: list[tuple[int, str]] = []
+    for i, hdr in enumerate(headers):
+        body_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        body = text[hdr.end():body_end]
+        brackets = _SCRIPT_BLOCK_RE.findall(body)
+        script = brackets[-1].strip() if brackets else ""
+        out.append((int(hdr.group(1)), script))
+    return out
+
+
+def find_intro_end_script(
+    scripts: list[tuple[int, str]],
+    marker_pattern: str = DEFAULT_ANCHOR_MARKERS,
+) -> tuple[int, str] | None:
+    """Первая пара (номер промпта, сценарий), в которой встречается фраза-маркер конца интро."""
+    try:
+        rx = re.compile(marker_pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise DraftError(f"Некорректный шаблон маркера конца интро: {marker_pattern} ({exc})") from exc
+
+    for num, script in scripts:
+        if script and rx.search(script):
+            return num, script
+    return None
+
+
+def _material_display_name(mat: dict) -> str:
+    name = str(mat.get("material_name") or mat.get("name") or "")
+    if name:
+        return name
+    path = str(mat.get("path") or "")
+    return Path(path.replace("\\", "/")).name if path else ""
+
+
+def _prompt_number_from_name(name: str) -> int | None:
+    """«D:/.../videos/12.mp4» → 12; для произвольных имён → None."""
+    if not name:
+        return None
+    stem = Path(name.replace("\\", "/")).stem.strip()
+    return int(stem) if stem.isdigit() else None
+
+
+def _numbered_clip_positions(data: dict) -> tuple[list[dict], dict[int, int]]:
+    """Клипы основной видеодорожки и карта «номер промпта → индекс клипа»."""
+    _, main_track = pick_main_track(data.get("tracks", []))
+    segments = [s for s in (main_track.get("segments") or []) if isinstance(s, dict)]
+    names = {
+        m.get("id"): _material_display_name(m)
+        for m in (data.get("materials", {}) or {}).get("videos", [])
+        if isinstance(m, dict) and m.get("id")
+    }
+
+    positions: dict[int, int] = {}
+    for idx, seg in enumerate(segments):
+        num = _prompt_number_from_name(names.get(seg.get("material_id"), ""))
+        if num is not None and num not in positions:
+            positions[num] = idx
+    return segments, positions
+
+
+def find_prompt_segment_start_us(data: dict, prompt_num: int) -> int:
+    """
+    Время (мкс) начала клипа, соответствующего промпту N.
+
+    Клипы нумеруются по имени файла (1.mp4, 2.mp4 …). Если клип промпта заменён
+    стоковым видео без номера, позиция вычисляется по соседним нумерованным клипам.
+    """
+    segments, positions = _numbered_clip_positions(data)
+    if not segments:
+        raise DraftError("В проекте нет клипов на основной видеодорожке.")
+    if not positions:
+        raise DraftError(
+            "Не удалось сопоставить промпты с клипами: на основной дорожке нет клипов "
+            "с числовыми именами (1.mp4, 2.mp4, …)."
+        )
+
+    idx = positions.get(prompt_num)
+    if idx is None:
+        lower = [n for n in positions if n < prompt_num]
+        upper = [n for n in positions if n > prompt_num]
+        candidates: list[int] = []
+        if lower:
+            n_lo = max(lower)
+            cand = positions[n_lo] + (prompt_num - n_lo)
+            if 0 <= cand < len(segments) and (not upper or cand < positions[min(upper)]):
+                candidates.append(cand)
+        if upper:
+            n_hi = min(upper)
+            cand = positions[n_hi] - (n_hi - prompt_num)
+            if 0 <= cand < len(segments) and (not lower or cand > positions[max(lower)]):
+                candidates.append(cand)
+        if not candidates:
+            raise DraftError(
+                f"Не удалось найти кадр для промпта #{prompt_num}: в проекте нет клипа "
+                f"«{prompt_num}.mp4», а соседние клипы не позволяют вычислить позицию."
+            )
+        idx = candidates[0]
+
+    timerange = segments[idx].get("target_timerange") or {}
+    return max(0, int(timerange.get("start") or 0))
+
+
+def _suggest_anchor_candidates(data: dict, scripts: list[tuple[int, str]], limit: int = 5) -> list[str]:
+    """Подсказки для пользователя: кадры, где встречается что-то похожее на «начн…»."""
+    try:
+        rx = re.compile(r"\bнач\w+", re.IGNORECASE)
+    except re.error:
+        return []
+
+    lines: list[str] = []
+    for num, script in scripts:
+        if not script or not rx.search(script):
+            continue
+        try:
+            start_us = find_prompt_segment_start_us(data, num)
+            when = f"{start_us / 1e6:.2f} с"
+        except DraftError:
+            when = "? с"
+        snippet = script.strip()
+        if len(snippet) > 70:
+            snippet = snippet[:70] + "…"
+        lines.append(f"  кадр #{num} ({when}): «{snippet}»")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def resolve_intro_anchor(
+    data: dict,
+    prompts_path: Path | str | None = None,
+    marker_pattern: str = DEFAULT_ANCHOR_MARKERS,
+    anchor_prompt: int | None = None,
+) -> dict:
+    """
+    Определяет кадр, на котором должно закончиться интро.
+
+    Возвращает {"prompt": N, "script": "...", "start_us": ...}.
+    """
+    prompt_num: int | None = None
+    script = ""
+
+    if anchor_prompt is not None:
+        prompt_num = int(anchor_prompt)
+        if prompt_num < 1:
+            raise DraftError("Номер кадра (промпта) должен быть >= 1.")
+        if prompts_path:
+            try:
+                for num, txt in parse_prompt_scripts(Path(prompts_path)):
+                    if num == prompt_num:
+                        script = txt
+                        break
+            except DraftError:
+                pass
+    elif prompts_path:
+        scripts = parse_prompt_scripts(Path(prompts_path))
+        found = find_intro_end_script(scripts, marker_pattern)
+        if found is None:
+            message = [
+                "В файле промптов не найдена фраза конца интро "
+                f"(шаблон поиска: {marker_pattern}).",
+                "Укажите кадр вручную (поле «Кадр №» / --anchor-prompt) "
+                "или свой шаблон (поле «Маркер» / --anchor-markers).",
+            ]
+            hints = _suggest_anchor_candidates(data, scripts)
+            if hints:
+                message.append("Похожие кадры — проверьте, какой из них нужен:")
+                message.extend(hints)
+            raise DraftError("\n".join(message))
+        prompt_num, script = found
+
+    if prompt_num is None:
+        raise DraftError("Не задан ни файл промптов, ни номер кадра для конца интро.")
+
+    return {
+        "prompt": prompt_num,
+        "script": script,
+        "start_us": find_prompt_segment_start_us(data, prompt_num),
+    }
+
+
 def add_intro_and_ambient(
     data: dict,
     intro_path: Path | None,
     ambient_path: Path | None,
     volume_db: float = -7.0,
     fade_us: int = 4_000_000,
+    intro_anchor_us: int | None = None,
+    intro_tail_trim_us: int = INTRO_TAIL_TRIM_US,
+    intro_fade_out_us: int = INTRO_FADE_OUT_US,
+    ambient_fade_in_us: int = AMBIENT_FADE_IN_US,
 ) -> dict:
-    """Добавляет intro (с 00:00, fade in) и ambient (после intro, обрезка по видео, fade out)."""
+    """
+    Добавляет intro и ambient на авто-дорожку.
+
+    intro_anchor_us — время, на котором интро должно закончиться (кадр «начнём с…»).
+    Если якорь задан, интро играет так, чтобы его конец совпал с этим кадром:
+    длинное интро подрезается с начала, а короткое замедляется (speed < 1),
+    чтобы растянуться ровно до кадра. Последние intro_tail_trim_us секунд
+    файла intro не используются. Переход: Fade Out у intro, Fade In у ambient.
+    """
     video_dur = get_video_duration_us(data)
     mats = data.setdefault("materials", {})
     track = _find_or_create_auto_audio_track(data)
     vol = db_to_linear(volume_db)
 
+    summary = {
+        "video_duration_us": video_dur,
+        "anchor_us": intro_anchor_us,
+        "intro": None,
+        "ambient": None,
+        "warnings": [],
+    }
     cursor_us = 0
-    summary = {"video_duration_us": video_dur, "intro": None, "ambient": None}
 
     if intro_path is not None:
         intro_full_dur = probe_audio_duration_us(intro_path)
-        intro_seg_dur = min(intro_full_dur, video_dur)
-        if intro_seg_dur > 0:
-            fade_in = min(fade_us, intro_seg_dur)
+        usable_us = intro_full_dur - max(0, int(intro_tail_trim_us))
+        if usable_us <= 0:
+            raise DraftError(
+                f"Intro длится {intro_full_dur / 1e6:.2f} с — после отрезания хвоста "
+                f"{max(0, int(intro_tail_trim_us)) / 1e6:.2f} с не остаётся звука. "
+                "Уменьшите «Хвост intro» или проверьте файл."
+            )
+
+        anchor_us = None
+        if intro_anchor_us is not None:
+            anchor_us = max(0, min(int(video_dur), int(intro_anchor_us)))
+
+        source_start_us = 0
+        source_dur_us = usable_us
+        seg_dur = min(usable_us, video_dur)
+        seg_start = 0
+        speed = 1.0
+
+        if anchor_us is not None:
+            if usable_us > anchor_us:
+                # Звук длиннее кадра: отрезаем начало, конец ровно в кадр.
+                source_start_us = usable_us - anchor_us
+                source_dur_us = anchor_us
+                seg_dur = anchor_us
+            elif usable_us < anchor_us:
+                # Звук короче кадра: замедляем, растягивая ровно до кадра.
+                speed = usable_us / anchor_us
+                if speed < MIN_INTRO_SPEED:
+                    speed = MIN_INTRO_SPEED
+                    seg_dur = round(source_dur_us / speed)
+                    summary["warnings"].append(
+                        f"Чтобы попасть в кадр, интро нужно замедлить в "
+                        f"{anchor_us / usable_us:.1f} раза, но максимум — "
+                        f"в {1 / MIN_INTRO_SPEED:.0f} раза: звук закончится раньше кадра "
+                        f"на {max(0, anchor_us - seg_dur) / 1e6:.2f} с."
+                    )
+                else:
+                    seg_dur = anchor_us
+            else:
+                seg_dur = anchor_us
+
+        if seg_dur > 0:
+            fade_in = min(int(fade_us), seg_dur)
+            fade_out = min(max(0, int(intro_fade_out_us)), seg_dur)
             seg = _create_audio_segment(
                 mats, intro_path, intro_full_dur,
-                target_start_us=0,
-                target_duration_us=intro_seg_dur,
+                target_start_us=seg_start,
+                target_duration_us=seg_dur,
                 volume_linear=vol,
                 fade_in_us=fade_in,
-                fade_out_us=0,
+                fade_out_us=fade_out,
+                source_start_us=source_start_us,
+                source_duration_us=source_dur_us,
+                speed=speed,
             )
             track["segments"].append(seg)
-            cursor_us = intro_seg_dur
-            summary["intro"] = {"start_us": 0, "duration_us": intro_seg_dur, "fade_in_us": fade_in}
+            cursor_us = seg_start + seg_dur
+            summary["intro"] = {
+                "start_us": seg_start,
+                "duration_us": seg_dur,
+                "source_start_us": source_start_us,
+                "source_duration_us": source_dur_us,
+                "speed": speed,
+                "fade_in_us": fade_in,
+                "fade_out_us": fade_out,
+                "trimmed_tail_us": max(0, int(intro_tail_trim_us)),
+            }
 
     if ambient_path is not None:
         ambient_full_dur = probe_audio_duration_us(ambient_path)
         remaining_us = max(0, video_dur - cursor_us)
-        ambient_seg_dur = min(ambient_full_dur, remaining_us)
-        if ambient_seg_dur > 0:
-            fade_out = min(fade_us, ambient_seg_dur)
+        ambient_dur = min(ambient_full_dur, remaining_us)
+        if ambient_dur > 0:
+            fade_in = min(max(0, int(ambient_fade_in_us)), ambient_dur)
+            fade_out = min(int(fade_us), ambient_dur)
             seg = _create_audio_segment(
                 mats, ambient_path, ambient_full_dur,
                 target_start_us=cursor_us,
-                target_duration_us=ambient_seg_dur,
+                target_duration_us=ambient_dur,
                 volume_linear=vol,
-                fade_in_us=0,
+                fade_in_us=fade_in,
                 fade_out_us=fade_out,
             )
             track["segments"].append(seg)
             summary["ambient"] = {
                 "start_us": cursor_us,
-                "duration_us": ambient_seg_dur,
+                "duration_us": ambient_dur,
+                "fade_in_us": fade_in,
                 "fade_out_us": fade_out,
             }
 
@@ -532,6 +830,12 @@ def process_project(
     normalize_voice: bool = True,
     video_fade_out: bool = True,
     dry_run: bool = False,
+    prompts_path: Path | str | None = None,
+    anchor_markers: str = DEFAULT_ANCHOR_MARKERS,
+    anchor_prompt: int | None = None,
+    intro_tail_sec: float = INTRO_TAIL_TRIM_US / 1_000_000,
+    intro_fade_out_sec: float = INTRO_FADE_OUT_US / 1_000_000,
+    ambient_fade_in_sec: float = AMBIENT_FADE_IN_US / 1_000_000,
 ) -> dict:
     """Выполняет настройку аудио и финального Fade Out для проекта CapCut."""
     if not dry_run and capcut_is_running():
@@ -542,7 +846,24 @@ def process_project(
     work = copy.deepcopy(data) if dry_run else data
 
     fade_us = round(fade_sec * 1_000_000)
-    result = {"draft_path": str(draft_path), "audio": None, "voice": [], "video_fade": None}
+    result = {
+        "draft_path": str(draft_path),
+        "audio": None,
+        "voice": [],
+        "video_fade": None,
+        "anchor": None,
+    }
+
+    anchor_us = None
+    if intro_path is not None and (prompts_path is not None or anchor_prompt is not None):
+        anchor = resolve_intro_anchor(
+            work,
+            prompts_path=prompts_path,
+            marker_pattern=anchor_markers or DEFAULT_ANCHOR_MARKERS,
+            anchor_prompt=anchor_prompt,
+        )
+        result["anchor"] = anchor
+        anchor_us = anchor["start_us"]
 
     if intro_path is not None or ambient_path is not None:
         result["audio"] = add_intro_and_ambient(
@@ -551,6 +872,10 @@ def process_project(
             ambient_path=ambient_path,
             volume_db=volume_db,
             fade_us=fade_us,
+            intro_anchor_us=anchor_us,
+            intro_tail_trim_us=round(max(0.0, intro_tail_sec) * 1_000_000),
+            intro_fade_out_us=round(max(0.0, intro_fade_out_sec) * 1_000_000),
+            ambient_fade_in_us=round(max(0.0, ambient_fade_in_sec) * 1_000_000),
         )
 
     if normalize_voice:
@@ -575,6 +900,18 @@ def main(argv=None) -> int:
     ap.add_argument("project", help="Папка проекта CapCut или путь к draft_content.json")
     ap.add_argument("--intro", default=None, help="Путь к аудиофайлу intro")
     ap.add_argument("--ambient", default=None, help="Путь к аудиофайлу ambient")
+    ap.add_argument("--prompts", default=None,
+                    help="Файл промптов кадров (.txt со сценарием в [...] под каждым [PROMPT #N])")
+    ap.add_argument("--anchor-markers", default=None,
+                    help=f"Regex фразы конца интро (по умолч. {DEFAULT_ANCHOR_MARKERS})")
+    ap.add_argument("--anchor-prompt", type=int, default=None,
+                    help="Номер промпта/кадра, на котором должно закончиться интро (вместо поиска по фразе)")
+    ap.add_argument("--intro-tail", type=float, default=INTRO_TAIL_TRIM_US / 1_000_000,
+                    help="Сколько секунд хвоста intro не использовать (по умолч. 6.0)")
+    ap.add_argument("--intro-fade-out", type=float, default=INTRO_FADE_OUT_US / 1_000_000,
+                    help="Fade Out intro на переходе в ambient, сек (по умолч. 4.5)")
+    ap.add_argument("--ambient-fade-in", type=float, default=AMBIENT_FADE_IN_US / 1_000_000,
+                    help="Fade In ambient после intro, сек (по умолч. 3.0)")
     ap.add_argument("--voice", default="voice", help="Подстрока для поиска дорожки озвучки (по умолч. voice)")
     ap.add_argument("--db", type=float, default=-7.0, help="Громкость intro/ambient в дБ (по умолч. -7.0)")
     ap.add_argument("--fade", type=float, default=4.0, help="Длительность fade-эффектов в сек (по умолч. 4.0)")
@@ -586,6 +923,7 @@ def main(argv=None) -> int:
 
     intro = Path(args.intro) if args.intro else None
     ambient = Path(args.ambient) if args.ambient else None
+    prompts = Path(args.prompts) if args.prompts else None
 
     try:
         res = process_project(
@@ -599,23 +937,44 @@ def main(argv=None) -> int:
             normalize_voice=not args.no_norm,
             video_fade_out=not args.no_video_fade,
             dry_run=args.dry_run,
+            prompts_path=prompts,
+            anchor_markers=args.anchor_markers or DEFAULT_ANCHOR_MARKERS,
+            anchor_prompt=args.anchor_prompt,
+            intro_tail_sec=args.intro_tail,
+            intro_fade_out_sec=args.intro_fade_out,
+            ambient_fade_in_sec=args.ambient_fade_in,
         )
     except DraftError as exc:
         print(f"[ОШИБКА] {exc}", file=sys.stderr)
         return 1
 
     print(f"Проект: {res['draft_path']}")
+    if res.get("anchor"):
+        an = res["anchor"]
+        script = (an.get("script") or "").strip()
+        if len(script) > 90:
+            script = script[:90] + "…"
+        print(f"  Конец интро: кадр #{an['prompt']} на {an['start_us']/1e6:.2f} с"
+              + (f" — «{script}»" if script else ""))
     if res["audio"]:
         a = res["audio"]
         print(f"Видео: {a['video_duration_us'] / 1_000_000:.2f} с")
         if a["intro"]:
             i = a["intro"]
-            print(f"  Intro: {i['start_us']/1e6:.2f}..{(i['start_us']+i['duration_us'])/1e6:.2f} с, "
-                  f"громкость {args.db:+.1f} дБ, Fade In {i['fade_in_us']/1e6:.2f} с")
+            speed = float(i.get("speed") or 1.0)
+            speed_txt = f", скорость {speed:.3f}x (замедление)" if abs(speed - 1.0) > 1e-6 else ""
+            print(f"  Intro: {i['start_us']/1e6:.2f}..{(i['start_us']+i['duration_us'])/1e6:.2f} с "
+                  f"(отступ в файле {i['source_start_us']/1e6:.2f} с, хвост не используется: "
+                  f"{i['trimmed_tail_us']/1e6:.2f} с{speed_txt}), "
+                  f"громкость {args.db:+.1f} дБ, Fade In {i['fade_in_us']/1e6:.2f} с, "
+                  f"Fade Out {i['fade_out_us']/1e6:.2f} с")
         if a["ambient"]:
             m = a["ambient"]
             print(f"  Ambient: {m['start_us']/1e6:.2f}..{(m['start_us']+m['duration_us'])/1e6:.2f} с, "
-                  f"громкость {args.db:+.1f} дБ, Fade Out {m['fade_out_us']/1e6:.2f} с")
+                  f"громкость {args.db:+.1f} дБ, Fade In {m['fade_in_us']/1e6:.2f} с, "
+                  f"Fade Out {m['fade_out_us']/1e6:.2f} с")
+        for warn in a.get("warnings") or []:
+            print(f"  [!] {warn}")
     if not args.no_norm:
         if res["voice"]:
             for v in res["voice"]:
