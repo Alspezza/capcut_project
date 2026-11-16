@@ -241,9 +241,18 @@ def test_find_intro_end_script_ignores_similar_words():
         (1, "а начинал с грузовиков, которые везли меньше."),
         (2, "История этого рекорда начинается в цеху."),
         (3, "цикл начинается заново."),
-        (4, "Начнём с самого льда."),
+        (4, "мастера начали вручную собирать то, чего не было."),
+        (5, "Начнём с самого льда."),
     ]
-    assert setup_audio.find_intro_end_script(scripts) == (4, "Начнём с самого льда.")
+    assert setup_audio.find_intro_end_script(scripts) == (5, "Начнём с самого льда.")
+
+
+def test_find_intro_end_script_matches_nachalos():
+    scripts = [
+        (1, "мастера начали вручную собирать салон."),
+        (2, "А началось всё в середине девяностых."),
+    ]
+    assert setup_audio.find_intro_end_script(scripts) == (2, "А началось всё в середине девяностых.")
 
 
 def test_find_prompt_segment_start_us_exact_and_inferred(tmp_path):
