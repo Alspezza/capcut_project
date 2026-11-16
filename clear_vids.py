@@ -124,23 +124,34 @@ def score_marks(gray, marks, margin):
     """
     Лучшее совпадение звезды вокруг каждого известного места.
     gray — float32 (кадр или усреднённый кадр). Возвращает (score, номер метки, (x, y, size)).
+    Перед сопоставлением вычитается локальный размытый фон (high-pass), чтобы
+    перепады яркости фона (плинтус, тени, горизонт) не забивали полупрозрачную звезду.
     """
     h, w = gray.shape[:2]
     g = blur_gray(gray)
     best = (-1.0, -1, None)
     for mi, (fx, fy, fs) in enumerate(marks):
         cx, cy, size = fx * w, fy * h, fs * w
+        sigma = max(4.0, size * 0.25)
+        bg_pad = int(np.ceil(sigma * 3))
+        max_half = int(np.ceil(size * max(SIZE_STEPS) * 1.7)) // 2 + 2
+        rx0, ry0 = max(0, int(cx - margin - max_half) - bg_pad), max(0, int(cy - margin - max_half) - bg_pad)
+        rx1, ry1 = min(w, int(cx + margin + max_half + 1) + bg_pad), min(h, int(cy + margin + max_half + 1) + bg_pad)
+        roi = g[ry0:ry1, rx0:rx1]
+        if roi.size == 0:
+            continue
+        roi_hp = roi - cv2.GaussianBlur(roi, (0, 0), sigma)
         for rel in SIZE_STEPS:
             t = star_template(size * rel)
             n = t.shape[0]
             half = n // 2
-            x0, y0 = int(cx - margin - half), int(cy - margin - half)
-            x1, y1 = int(cx + margin + half + 1), int(cy + margin + half + 1)
-            x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
-            sub = g[y0:y1, x0:x1]
+            x0, y0 = max(0, int(cx - margin - half)), max(0, int(cy - margin - half))
+            x1, y1 = min(w, int(cx + margin + half + 1)), min(h, int(cy + margin + half + 1))
+            sub = roi_hp[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0]
             if sub.shape[0] < n or sub.shape[1] < n:
                 continue
-            res = cv2.matchTemplate(sub, t, cv2.TM_CCOEFF_NORMED)
+            t_hp = t - cv2.GaussianBlur(t, (0, 0), sigma)
+            res = cv2.matchTemplate(sub, t_hp, cv2.TM_CCOEFF_NORMED)
             res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
             _, mx, _, loc = cv2.minMaxLoc(res)
             if mx > best[0]:

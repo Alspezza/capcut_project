@@ -175,6 +175,7 @@ def apply_transitions(
     min_clip_sec: float = 0.0,
     skip_edges: bool = False,
     seed: int | None = None,
+    snap_timeline: bool = False,
 ) -> dict:
     if isinstance(every, bool) or not isinstance(every, int) or every < 1:
         raise TransitionsError("Параметр --every должен быть целым числом >= 1.")
@@ -200,9 +201,28 @@ def apply_transitions(
                               "is_overlap": t["is_overlap"]}
              for t in trans_list}
 
-    _, main_track = pick_main_track(data["tracks"])
+    video_tracks = [t for t in data["tracks"] if isinstance(t, dict) and t.get("type") == "video"]
+    main_idx, main_track = pick_main_track(data["tracks"])
     # работаем с отсортированной копией, порядок сегментов в файле не трогаем
     segs = sorted(main_track["segments"], key=lambda s: s["target_timerange"]["start"])
+    main_is_overlay = main_idx > 0 and not (video_tracks[0].get("segments") or [])
+    moved_to_main = 0
+    closed_gaps = 0
+
+    if snap_timeline:
+        if main_is_overlay:
+            video_tracks[0]["segments"] = list(segs)
+            main_track["segments"] = []
+            main_track = video_tracks[0]
+            moved_to_main = len(segs)
+            main_is_overlay = False
+        for i in range(len(segs) - 1):
+            cur_end = segs[i]["target_timerange"]["start"] + segs[i]["target_timerange"]["duration"]
+            nxt_tr = segs[i + 1]["target_timerange"]
+            if abs(nxt_tr["start"] - cur_end) > EPS:
+                nxt_tr["start"] = cur_end
+                closed_gaps += 1
+
     skip_times = overlay_starts(data["tracks"], main_track) if skip_overlays else []
 
     # материалы, после которых CapCut вставляет переход в extra_material_refs
@@ -226,39 +246,63 @@ def apply_transitions(
     min_clip_us = round(min_clip_sec * 1_000_000)
     rng = random.Random(seed) if chance < 100.0 else None
     placed = skipped = 0
+    skip_reasons = {"gaps": 0, "overlays": 0, "edges": 0, "min_clip": 0, "every": 0, "chance": 0, "repeat": 0}
+    sample_gap_us: int | None = None
     cand_idx = 0
     k = 0
+    last_effect_id: str | None = None
     last_joint = len(segs) - 2
     for i, s in enumerate(segs[:-1]):
         nxt = segs[i + 1]
         end = s["target_timerange"]["start"] + s["target_timerange"]["duration"]
-        if abs(nxt["target_timerange"]["start"] - end) > EPS:   # дыра / наложение клипов
+        gap = nxt["target_timerange"]["start"] - end
+        if abs(gap) > EPS:   # дыра / наложение клипов
             skipped += 1
+            skip_reasons["gaps"] += 1
+            if sample_gap_us is None:
+                sample_gap_us = gap
             continue
         if any(abs(end - t) < EPS for t in skip_times):         # на стыке оверлей
             skipped += 1
+            skip_reasons["overlays"] += 1
             continue
         if skip_edges and (i == 0 or i == last_joint):          # крайние стыки
             skipped += 1
+            skip_reasons["edges"] += 1
             continue
         if min_clip_us > 0 and (
             s["target_timerange"]["duration"] < min_clip_us
             or nxt["target_timerange"]["duration"] < min_clip_us
         ):
             skipped += 1
+            skip_reasons["min_clip"] += 1
             continue
 
         cur_cand = cand_idx
         cand_idx += 1
         if every > 1 and (cur_cand % every) != 0:
             skipped += 1
+            skip_reasons["every"] += 1
             continue
         if rng is not None and (rng.random() * 100.0) >= chance:
             skipped += 1
+            skip_reasons["chance"] += 1
             continue
 
         effect_id = pattern[k % len(pattern)]
         k += 1
+        if last_effect_id is not None and effect_id == last_effect_id:
+            for _ in range(len(pattern)):
+                cand = pattern[k % len(pattern)]
+                k += 1
+                if cand != last_effect_id:
+                    effect_id = cand
+                    break
+            else:
+                skipped += 1
+                skip_reasons["repeat"] += 1
+                continue
+        last_effect_id = effect_id
         limit = min(s["target_timerange"]["duration"], nxt["target_timerange"]["duration"]) // 2
         duration = min(durations_map[effect_id], limit)
 
@@ -274,11 +318,22 @@ def apply_transitions(
         placed += 1
 
     stats = {"clips": len(segs), "removed": len(removed),
-             "placed": placed, "skipped": skipped, "backup": None}
+             "placed": placed, "skipped": skipped, "backup": None,
+             "moved_to_main": moved_to_main, "closed_gaps": closed_gaps}
     log(f"Файл: {path}")
     log(f"Основная дорожка: {stats['clips']} клипов")
+    if moved_to_main:
+        log(f"Перенесено клипов на основную дорожку #0: {moved_to_main}")
+    if closed_gaps:
+        log(f"Сдвинуто клипов встык (убрано зазоров/наложений): {closed_gaps}")
+    if main_is_overlay:
+        log("[!] Основная дорожка #0 пустая — клипы на верхней дорожке (оверлее). "
+            "Включите «Перенести на осн. дорожку и убрать зазоры» (--snap-timeline).")
     log(f"Старых переходов удалено: {stats['removed']}")
     log(f"Новых поставлено: {placed}, стыков пропущено: {skipped}")
+    if skip_reasons["gaps"] > 0 and sample_gap_us is not None:
+        log(f"  пропущено из-за зазоров/наложений: {skip_reasons['gaps']} "
+            f"(пример: {sample_gap_us / 1000:.1f} мс)")
 
     if dry_run:
         log("--dry-run: файл не изменён.")
@@ -307,6 +362,8 @@ def main():
                     help="не ставить переход после первого и перед последним клипом")
     ap.add_argument("--seed", type=int, default=None,
                     help="зерно генератора случайных чисел для --chance")
+    ap.add_argument("--snap-timeline", action="store_true",
+                    help="перенести клипы с оверлея на пустую осн. дорожку #0 и убрать зазоры/наложения")
     ap.add_argument("--force", action="store_true",
                     help="не проверять, запущен ли CapCut")
     args = ap.parse_args()
@@ -321,6 +378,7 @@ def main():
             min_clip_sec=args.min_clip_sec,
             skip_edges=args.skip_edges,
             seed=args.seed,
+            snap_timeline=args.snap_timeline,
         )
     except TransitionsError as e:
         sys.exit(f"Ошибка: {e}")

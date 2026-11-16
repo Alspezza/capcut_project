@@ -361,6 +361,93 @@ class TestMakeTransitions(unittest.TestCase):
             self.assertEqual(durs["7140916992118100482"], 1_150_000)
             self.assertEqual(pat, ["7159450506648097281", "7140916992118100482"])
 
+    def test_snap_timeline_moves_overlay_and_closes_gaps(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "proj"
+            proj.mkdir()
+            d = make_sample_draft(with_overlay=False)
+            # Основная дорожка пустая, все клипы на оверлее и с зазорами 33 мс
+            segs = d["tracks"][0]["segments"]
+            segs[1]["target_timerange"]["start"] += 33_000
+            segs[2]["target_timerange"]["start"] += 66_000
+            d["tracks"] = [
+                {"id": "T0", "type": "video", "segments": []},
+                {"id": "T1", "type": "video", "segments": segs},
+            ]
+            dc = proj / "draft_content.json"
+            dc.write_text(json.dumps(d), encoding="utf-8")
+
+            # Без snap_timeline: стыки пропускаются и в логе есть предупреждение
+            logs = []
+            st_off = make_transitions.apply_transitions(
+                proj, dry_run=True, force=True, log=logs.append
+            )
+            self.assertEqual(st_off["placed"], 0)
+            self.assertEqual(st_off["skipped"], 2)
+            self.assertTrue(any("--snap-timeline" in line for line in logs))
+
+            # Со snap_timeline: клипы перенесены на track 0, зазоры закрыты, переходы поставлены
+            st_on = make_transitions.apply_transitions(
+                proj, dry_run=False, force=True, snap_timeline=True, log=lambda *_: None
+            )
+            self.assertEqual(st_on["moved_to_main"], 3)
+            self.assertEqual(st_on["closed_gaps"], 2)
+            self.assertEqual(st_on["placed"], 2)
+            self.assertEqual(st_on["skipped"], 0)
+
+            updated = json.loads(dc.read_text(encoding="utf-8"))
+            self.assertEqual(len(updated["tracks"][0]["segments"]), 3)
+            self.assertEqual(len(updated["tracks"][1]["segments"]), 0)
+            self.assertEqual(updated["tracks"][0]["segments"][1]["target_timerange"]["start"], 3_000_000)
+            self.assertEqual(updated["tracks"][0]["segments"][2]["target_timerange"]["start"], 6_000_000)
+
+    def test_no_consecutive_identical_transitions_even_with_chance(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "proj"
+            proj.mkdir()
+            d = make_sample_draft(with_overlay=False)
+            # Расширяем до 8 клипов (7 стыков)
+            d["tracks"][0]["segments"] = [
+                {
+                    "id": f"S{i}",
+                    "material_id": f"V{i}",
+                    "target_timerange": {"start": i * 3_000_000, "duration": 3_000_000},
+                    "extra_material_refs": [],
+                }
+                for i in range(8)
+            ]
+            dc = proj / "draft_content.json"
+            dc.write_text(json.dumps(d), encoding="utf-8")
+
+            id_a = "7159450506648097281"
+            id_b = "7140916992118100482"
+            durs = {id_a: 500_000, id_b: 500_000}
+
+            # 1) Шаблон с повторами [A, A, B] и вероятностью 60% — подряд одинаковых быть не должно
+            with mock.patch.object(make_transitions, "load_transition_pattern", return_value=(durs, [id_a, id_a, id_b])):
+                make_transitions.apply_transitions(
+                    proj, dry_run=False, force=True, chance=60.0, seed=7, log=lambda *_: None
+                )
+            updated = json.loads(dc.read_text(encoding="utf-8"))
+            by_id = {t["id"]: t["effect_id"] for t in updated["materials"]["transitions"]}
+            placed_effects = [
+                by_id[ref]
+                for seg in updated["tracks"][0]["segments"]
+                for ref in seg["extra_material_refs"]
+                if ref in by_id
+            ]
+            self.assertGreaterEqual(len(placed_effects), 2)
+            for prev_eff, cur_eff in zip(placed_effects, placed_effects[1:]):
+                self.assertNotEqual(prev_eff, cur_eff)
+
+            # 2) Шаблон из одного уникального ID — ставится максимум 1 переход, чтобы не было двух одинаковых подряд
+            with mock.patch.object(make_transitions, "load_transition_pattern", return_value=({id_a: 500_000}, [id_a])):
+                st_single = make_transitions.apply_transitions(
+                    proj, dry_run=False, force=True, chance=100.0, log=lambda *_: None
+                )
+            self.assertEqual(st_single["placed"], 1)
+            self.assertEqual(st_single["skipped"], 6)
+
 
 class TestClearVids(unittest.TestCase):
     @staticmethod
@@ -426,6 +513,27 @@ class TestClearVids(unittest.TestCase):
                 [0.1, 0.5, 1.0, 2.0, 3.0, 4.0], None, "0002", {},
             )
             self.assertFalse(found_clean)
+
+    def test_score_marks_detects_star_over_strong_gradient(self):
+        import numpy as np
+
+        w, h = 1280, 720
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        # Сильный перепад яркости фона (как светлый плинтус поверх тёмного пола)
+        bg = np.where(yy + 0.3 * xx < 600 + 0.3 * 1160, 210.0, 95.0).astype(np.float32)
+
+        star = clear_vids.star_template(int(round(0.0371 * w)))
+        sh, sw = star.shape
+        cx, cy = int(0.906 * w), int(0.833 * h)
+        y0, x0 = cy - sh // 2, cx - sw // 2
+        with_star = bg.copy()
+        with_star[y0:y0 + sh, x0:x0 + sw] = np.clip(with_star[y0:y0 + sh, x0:x0 + sw] + star * 55.0, 0, 255)
+
+        sc_wm, mi, _ = clear_vids.score_marks(with_star, clear_vids.DEFAULT_MARKS, 12)
+        sc_clean, _, _ = clear_vids.score_marks(bg, clear_vids.DEFAULT_MARKS, 12)
+        self.assertEqual(mi, 0)
+        self.assertGreaterEqual(sc_wm, clear_vids.DEFAULT_STACK_THR[0])
+        self.assertLess(sc_clean, clear_vids.DEFAULT_STACK_THR[0])
 
     def test_default_track_zero_even_when_overlay_has_more_clips(self):
         with tempfile.TemporaryDirectory() as td:
