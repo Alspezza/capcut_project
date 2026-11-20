@@ -120,6 +120,92 @@ class TestCapCutCommon(unittest.TestCase):
             self.assertTrue(restored.exists())
             self.assertEqual(json.loads(draft.read_text(encoding="utf-8"))["v"], 3)
 
+    def test_save_updates_existing_timelines_mirror(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "proj"
+            project.mkdir()
+            draft = project / "draft_content.json"
+            draft.write_text('{"v": 0}', encoding="utf-8")
+
+            tl1 = project / "Timelines" / "AAA"
+            tl2 = project / "Timelines" / "BBB"
+            tl1.mkdir(parents=True)
+            tl2.mkdir(parents=True)
+            mirror1 = tl1 / "draft_content.json"
+            mirror2 = tl2 / "draft_content.json"
+            mirror1.write_text('{"v": 0}', encoding="utf-8")
+            mirror2.write_text('{"v": 0}', encoding="utf-8")
+
+            # id драфта совпадает с основной (первой) временной шкалой
+            capcut_common.save_draft_with_backup(draft, {"id": "AAA", "v": 1}, prefix="test")
+
+            self.assertEqual(json.loads(draft.read_text(encoding="utf-8"))["v"], 1)
+            self.assertEqual(json.loads(mirror1.read_text(encoding="utf-8"))["v"], 1)
+            # Второстепенную шкалу не трогаем
+            self.assertEqual(json.loads(mirror2.read_text(encoding="utf-8"))["v"], 0)
+            # Старая версия зеркала сохранена рядом с ним
+            self.assertTrue(list((tl1 / ".backups").glob("draft_content.test_*.json")))
+            self.assertFalse((tl2 / ".backups").exists())
+
+    def test_save_without_timelines_does_not_create_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "proj"
+            project.mkdir()
+            draft = project / "draft_content.json"
+            draft.write_text('{"v": 0}', encoding="utf-8")
+
+            capcut_common.save_draft_with_backup(draft, {"id": "AAA", "v": 2}, prefix="test")
+
+            self.assertEqual(json.loads(draft.read_text(encoding="utf-8"))["v"], 2)
+            self.assertFalse((project / "Timelines").exists())
+
+    def test_save_skips_timelines_folder_without_mirror_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "proj"
+            project.mkdir()
+            draft = project / "draft_content.json"
+            draft.write_text('{"v": 0}', encoding="utf-8")
+            (project / "Timelines" / "AAA").mkdir(parents=True)
+
+            capcut_common.save_draft_with_backup(draft, {"id": "AAA", "v": 3}, prefix="test")
+
+            self.assertEqual(json.loads(draft.read_text(encoding="utf-8"))["v"], 3)
+            self.assertFalse((project / "Timelines" / "AAA" / "draft_content.json").exists())
+
+    def test_save_mirrors_single_timeline_without_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "proj"
+            project.mkdir()
+            draft = project / "draft_content.json"
+            draft.write_text('{"v": 0}', encoding="utf-8")
+            mirror = project / "Timelines" / "AAA" / "draft_content.json"
+            mirror.parent.mkdir(parents=True)
+            mirror.write_text('{"v": 0}', encoding="utf-8")
+
+            capcut_common.save_draft_with_backup(draft, {"v": 4}, prefix="test")
+
+            self.assertEqual(json.loads(mirror.read_text(encoding="utf-8"))["v"], 4)
+
+    def test_restore_updates_timelines_mirror(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "proj"
+            project.mkdir()
+            draft = project / "draft_content.json"
+            draft.write_text('{"v": 0}', encoding="utf-8")
+            mirror = project / "Timelines" / "AAA" / "draft_content.json"
+            mirror.parent.mkdir(parents=True)
+            mirror.write_text('{"v": 0}', encoding="utf-8")
+
+            capcut_common.save_draft_with_backup(draft, {"id": "AAA", "v": 5}, prefix="test")
+            # Имитируем рассинхрон: root и зеркало испорчены
+            draft.write_text('{"v": 999}', encoding="utf-8")
+            mirror.write_text('{"v": 999}', encoding="utf-8")
+
+            capcut_common.restore_latest_backup(draft)
+
+            self.assertEqual(json.loads(draft.read_text(encoding="utf-8"))["v"], 0)
+            self.assertEqual(json.loads(mirror.read_text(encoding="utf-8"))["v"], 0)
+
     def test_pick_main_track_with_empty_video_track(self):
         tracks = [
             {"type": "audio", "segments": [{"id": "A1"}]},

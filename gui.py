@@ -254,6 +254,7 @@ class App(tk.Tk):
         self.a_dry = tk.BooleanVar(value=g("a_dry", False))
         self.a_intro = tk.StringVar(value=g("a_intro", ""))
         self.a_ambient = tk.StringVar(value=g("a_ambient", ""))
+        self.a_subscribe = tk.StringVar(value=g("a_subscribe", ""))
         self.a_prompts = tk.StringVar(value=g("a_prompts", ""))
         self.a_markers = tk.StringVar(value=g("a_markers", ""))
         self.a_anchor_prompt = tk.StringVar(value=g("a_anchor_prompt", ""))
@@ -440,7 +441,7 @@ class App(tk.Tk):
                    command=lambda: self.start(["trans"])).pack(fill="x", padx=8, pady=(4, 8), side="bottom")
 
         # --- аудио + fade out
-        af = ttk.LabelFrame(parent, text="3. Аудио: Intro → Ambient по сценарию  (−7 дБ, хвост 6 с, Fade Out/In 4.5/3 с)")
+        af = ttk.LabelFrame(parent, text="3. Аудио: Intro → Ambient по сценарию + видео с подпиской  (−7 дБ, хвост 6 с, Fade Out/In 4.5/3 с)")
         af.pack(fill="x", **pad)
         af.columnconfigure(1, weight=1)
 
@@ -463,8 +464,17 @@ class App(tk.Tk):
         ttk.Button(af, text="Обзор…", command=self.browse_prompts_file).grid(
             row=2, column=2, padx=(6, 8), pady=2)
 
+        ttk.Label(af, text="Видео с подпиской:").grid(row=3, column=0, sticky="w", padx=(8, 6), pady=2)
+        self.e_subscribe = PlaceholderEntry(
+            af, self.a_subscribe,
+            "пусто = не добавлять; .mp4 с кнопкой подписки",
+        )
+        self.e_subscribe.grid(row=3, column=1, sticky="ew", pady=2)
+        ttk.Button(af, text="Обзор…", command=self.browse_subscribe_file).grid(
+            row=3, column=2, padx=(6, 8), pady=2)
+
         prow = ttk.Frame(af)
-        prow.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        prow.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
         ttk.Label(prow, text="Маркер конца интро:").pack(side="left")
         self.e_markers = PlaceholderEntry(
             prow, self.a_markers,
@@ -684,6 +694,17 @@ class App(tk.Tk):
         )
         if p:
             var.set(p)
+
+    def browse_subscribe_file(self):
+        cur = self.a_subscribe.get().strip().strip('"')
+        init_dir = str(Path(cur).parent) if cur and Path(cur).parent.is_dir() else str(APP_DIR)
+        p = filedialog.askopenfilename(
+            title="Выберите видео с кнопкой подписки",
+            initialdir=init_dir,
+            filetypes=[("Видеофайлы", "*.mp4 *.mov *.mkv *.avi *.webm"), ("Все файлы", "*.*")],
+        )
+        if p:
+            self.a_subscribe.set(p)
 
     def browse_prompts_file(self):
         cur = self.a_prompts.get().strip().strip('"')
@@ -936,15 +957,18 @@ class App(tk.Tk):
             return cmd
 
         if kind == "audio":
-            for widget in (self.e_prompts, self.e_markers, self.e_anchor):
+            for widget in (self.e_prompts, self.e_markers, self.e_anchor, self.e_subscribe):
                 widget.commit()
             cmd = self._base_worker_cmd("audio", SCRIPT_AUDIO) + [str(project)]
             intro_s = self.a_intro.get().strip().strip('"')
             ambient_s = self.a_ambient.get().strip().strip('"')
+            subscribe_s = self.a_subscribe.get().strip().strip('"')
             if intro_s:
                 cmd += ["--intro", intro_s]
             if ambient_s:
                 cmd += ["--ambient", ambient_s]
+            if subscribe_s:
+                cmd += ["--subscribe", subscribe_s]
             prompts_s = self.a_prompts.get().strip().strip('"')
             if prompts_s:
                 cmd += ["--prompts", prompts_s]
@@ -1163,7 +1187,7 @@ class App(tk.Tk):
     # ---- настройки -------------------------------------------------------
     def save_all(self):
         p = self.current_project()
-        for widget in (self.e_prompts, self.e_markers, self.e_anchor):
+        for widget in (self.e_prompts, self.e_markers, self.e_anchor, self.e_subscribe):
             widget.commit()
         self.cfg.update(
             drafts_dir=str(self.drafts_dir), last_project=str(p) if p else "",
@@ -1176,6 +1200,7 @@ class App(tk.Tk):
             c_track=self.c_track.get(), c_size=self.c_size.get(), c_probe=self.c_probe.get(),
             c_extra=self.c_extra.get(),
             a_dry=self.a_dry.get(), a_intro=self.a_intro.get(), a_ambient=self.a_ambient.get(),
+            a_subscribe=self.a_subscribe.get(),
             a_prompts=self.a_prompts.get(), a_markers=self.a_markers.get(),
             a_anchor_prompt=self.a_anchor_prompt.get(), a_voice=self.a_voice.get(),
             s_mode=self.s_mode.get(), s_target=self.s_target.get(), s_count=self.s_count.get(),

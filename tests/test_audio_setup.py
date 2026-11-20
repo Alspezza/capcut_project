@@ -91,7 +91,7 @@ def test_add_intro_and_ambient_placement_and_fades(tmp_path):
         "source_start_us": 0,
         "source_duration_us": 6_000_000,
         "speed": 1.0,
-        "fade_in_us": 4_000_000,
+        "fade_in_us": 0,  # в начале интро не должно быть «нарастания»
         "fade_out_us": 4_500_000,
         "trimmed_tail_us": 6_000_000,
     }
@@ -117,7 +117,7 @@ def test_add_intro_and_ambient_placement_and_fades(tmp_path):
     fades = {f["id"]: f for f in draft["materials"]["audio_fades"]}
     intro_fade = next(fades[r] for r in segs[0]["extra_material_refs"] if r in fades)
     ambient_fade = next(fades[r] for r in segs[1]["extra_material_refs"] if r in fades)
-    assert intro_fade["fade_in_duration"] == 4_000_000
+    assert intro_fade["fade_in_duration"] == 0
     assert intro_fade["fade_out_duration"] == 4_500_000
     assert ambient_fade["fade_in_duration"] == 3_000_000
     assert ambient_fade["fade_out_duration"] == 4_000_000
@@ -415,6 +415,92 @@ def test_dry_run_and_capcut_running_guard(tmp_path):
         res = setup_audio.process_project(proj_dir, dry_run=True, normalize_voice=False)
         assert "backup" not in res
         assert draft_file.read_text(encoding="utf-8") == original
+
+
+def test_plan_subscribe_placements_first_last_and_comment_near_middle(tmp_path):
+    draft = _make_sample_draft(video_durations=(60_000_000,) * 20)  # 20 минут
+    prompts = _prompts_file(tmp_path, [
+        (1, "Вступление без призывов."),
+        (2, "Подпишитесь на канал и поставьте лайк."),
+        (10, "Напишите в комментариях, что вы думаете."),
+        (19, "Подписка и лайк под этим видео."),
+    ])
+    scripts = setup_audio.parse_prompt_scripts(prompts)
+
+    plan = setup_audio.plan_subscribe_placements(draft, scripts, clip_duration_us=8_000_000)
+
+    assert [p["reason"] for p in plan["placements"]] == ["subscribe", "comment", "subscribe"]
+    assert [p["start_us"] for p in plan["placements"]] == [
+        60_000_000,   # кадр #2
+        540_000_000,  # кадр #10 — в пределах 3 минут от середины (600 с)
+        1_080_000_000,  # кадр #19
+    ]
+
+
+def test_plan_subscribe_placements_uses_middle_when_comment_is_far(tmp_path):
+    draft = _make_sample_draft(video_durations=(60_000_000,) * 20)
+    prompts = _prompts_file(tmp_path, [
+        (1, "Вступление."),
+        (2, "Подпишитесь на канал."),
+        (4, "Напишите в комментариях, что думаете."),  # 180 с: далеко от 600 с
+        (19, "Подписка и лайк."),
+    ])
+    scripts = setup_audio.parse_prompt_scripts(prompts)
+
+    plan = setup_audio.plan_subscribe_placements(draft, scripts, clip_duration_us=8_000_000)
+
+    reasons = [p["reason"] for p in plan["placements"]]
+    assert reasons == ["subscribe", "middle", "subscribe"]
+    middle = plan["placements"][1]
+    # Оверлей центрируется относительно середины ролика
+    assert middle["start_us"] == 600_000_000 - 4_000_000
+
+
+def test_add_subscribe_video_creates_overlay_track_above_main(tmp_path):
+    draft = _make_sample_draft(video_durations=(60_000_000,) * 20)
+    video = tmp_path / "Subscribe.mp4"
+    video.write_bytes(b"fake")
+    prompts = _prompts_file(tmp_path, [
+        (1, "Вступление."),
+        (2, "Подпишитесь на канал."),
+        (10, "Напишите в комментариях."),
+        (19, "Подписка и лайк."),
+    ])
+    video_info = {"duration_us": 8_100_000, "width": 1920, "height": 1080}
+    with (
+        patch("setup_audio.probe_video_info", return_value=video_info),
+        patch("setup_audio._guess_chroma_resource_path", return_value="C:/CapCut/Resources/Chroma2"),
+    ):
+        res = setup_audio.add_subscribe_video(draft, video, prompts)
+
+    assert [p["reason"] for p in res["placements"]] == ["subscribe", "comment", "subscribe"]
+    assert draft["tracks"][0]["type"] == "video"
+    overlay = draft["tracks"][1]
+    assert overlay["name"] == setup_audio.SUBSCRIBE_TRACK_NAME
+    assert len(overlay["segments"]) == 3
+
+    seg = overlay["segments"][0]
+    assert seg["clip"]["scale"]["x"] == pytest.approx(setup_audio.SUBSCRIBE_CLIP_SCALE)
+    assert seg["clip"]["transform"]["y"] == pytest.approx(setup_audio.SUBSCRIBE_CLIP_Y)
+    assert seg["target_timerange"] == {"start": 60_000_000, "duration": 8_100_000}
+
+    chromas = {c["id"]: c for c in draft["materials"]["chromas"]}
+    chroma = next(chromas[r] for r in seg["extra_material_refs"] if r in chromas)
+    assert chroma["color"] == setup_audio.SUBSCRIBE_CHROMA_COLOR
+    assert chroma["path"] == "C:/CapCut/Resources/Chroma2"
+
+    videos_before = len(draft["materials"]["videos"])
+
+    # Повторный запуск заменяет оверлеи и не плодит материалы
+    with (
+        patch("setup_audio.probe_video_info", return_value=video_info),
+        patch("setup_audio._guess_chroma_resource_path", return_value="C:/CapCut/Resources/Chroma2"),
+    ):
+        setup_audio.add_subscribe_video(draft, video, prompts)
+
+    assert len(draft["tracks"][1]["segments"]) == 3
+    assert len(draft["materials"]["videos"]) == videos_before
+    assert len(draft["materials"]["chromas"]) == 3
 
 
 def test_gui_dispatch_worker_audio(monkeypatch):
