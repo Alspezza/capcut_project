@@ -235,6 +235,7 @@ class App(tk.Tk):
         self.t_dry = tk.BooleanVar(value=g("t_dry", False))
         self.t_skip = tk.BooleanVar(value=g("t_skip", False))
         self.t_skip_edges = tk.BooleanVar(value=g("t_skip_edges", False))
+        self.t_snap_timeline = tk.BooleanVar(value=g("t_snap_timeline", False))
         self.t_every = tk.StringVar(value=g("t_every", "1"))
         self.t_chance = tk.StringVar(value=g("t_chance", "100"))
         self.t_min_clip = tk.StringVar(value=g("t_min_clip", "0"))
@@ -262,9 +263,11 @@ class App(tk.Tk):
         # stock fetcher
         self.s_mode = tk.StringVar(value=g("s_mode", "yt"))
         self.s_target = tk.StringVar(value=g("s_target", ""))
+        self.s_yt_targets_init = g("s_yt_targets", "") or (self.s_target.get() if self.s_mode.get() == "yt" else "")
         self.s_count = tk.StringVar(value=g("s_count", "3"))
         self.s_duration = tk.StringVar(value=g("s_duration", "30"))
         self.s_full = tk.BooleanVar(value=g("s_full", False))
+        self.s_no_audio = tk.BooleanVar(value=g("s_no_audio", False))
         self.s_batch_srv = tk.StringVar(value=g("s_batch_srv", "pexels"))
         self.s_output = tk.StringVar(value=g("s_output", str(APP_DIR / "downloads")))
 
@@ -417,6 +420,7 @@ class App(tk.Tk):
         ttk.Checkbutton(tf, text="Пробный прогон (ничего не записывать)", variable=self.t_dry).pack(anchor="w", padx=8, pady=(10, 2))
         ttk.Checkbutton(tf, text="Пропускать стыки, где начинается оверлей", variable=self.t_skip).pack(anchor="w", padx=8, pady=2)
         ttk.Checkbutton(tf, text="Не ставить после 1-го и перед последним клипом", variable=self.t_skip_edges).pack(anchor="w", padx=8, pady=2)
+        ttk.Checkbutton(tf, text="Перенести на осн. дорожку и убрать зазоры", variable=self.t_snap_timeline).pack(anchor="w", padx=8, pady=2)
 
         tadv = ttk.LabelFrame(tf, text="Параметры частоты (по умолч. = на каждый)")
         tadv.pack(fill="x", padx=8, pady=6)
@@ -523,14 +527,24 @@ class App(tk.Tk):
         pf = ttk.LabelFrame(parent, text="Параметры загрузки")
         pf.pack(fill="x", **pad)
 
-        # Строка цели (URL / запрос / файл)
+        # Строка цели (URL / список URL / запрос / файл)
         r1 = ttk.Frame(pf)
         r1.pack(fill="x", padx=8, pady=(8, 4))
         self.lbl_s_target = ttk.Label(r1, text="Ссылка / файл:", width=18)
-        self.lbl_s_target.pack(side="left")
-        ttk.Entry(r1, textvariable=self.s_target).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.lbl_s_target.pack(side="left", anchor="n", pady=2)
+        self.s_target_container = ttk.Frame(r1)
+        self.s_target_container.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.ent_s_target = ttk.Entry(self.s_target_container, textvariable=self.s_target)
+        self.txt_s_targets_frame = ttk.Frame(self.s_target_container)
+        self.txt_s_targets = tk.Text(self.txt_s_targets_frame, height=4, wrap="none", font=("Consolas", 9))
+        yt_sb = ttk.Scrollbar(self.txt_s_targets_frame, orient="vertical", command=self.txt_s_targets.yview)
+        self.txt_s_targets.configure(yscrollcommand=yt_sb.set)
+        self.txt_s_targets.pack(side="left", fill="both", expand=True)
+        yt_sb.pack(side="right", fill="y")
+        if self.s_yt_targets_init:
+            self.txt_s_targets.insert("1.0", self.s_yt_targets_init)
         self.btn_s_browse_file = ttk.Button(r1, text="Файл…", command=self.browse_stock_file)
-        self.btn_s_browse_file.pack(side="left", padx=(6, 0))
+        self.btn_s_browse_file.pack(side="left", anchor="n", padx=(6, 0))
 
         # Строка опций (количество / длительность / сервис)
         r2 = ttk.Frame(pf)
@@ -540,6 +554,7 @@ class App(tk.Tk):
         self.ent_s_duration = ttk.Entry(r2, textvariable=self.s_duration, width=8)
         self.ent_s_count = ttk.Entry(r2, textvariable=self.s_count, width=8)
         self.chk_s_full = ttk.Checkbutton(r2, text="Скачать видео целиком (игнорировать таймкод)", variable=self.s_full)
+        self.chk_s_no_audio = ttk.Checkbutton(r2, text="Без звука", variable=self.s_no_audio)
         self.cmb_s_srv = ttk.Combobox(r2, textvariable=self.s_batch_srv, values=["pexels", "pixabay"], state="readonly", width=10)
 
         # Строка папки назначения
@@ -562,22 +577,34 @@ class App(tk.Tk):
 
     def _update_stock_mode_ui(self):
         mode = self.s_mode.get()
-        for w in (self.ent_s_duration, self.ent_s_count, self.chk_s_full, self.cmb_s_srv):
+        for w in (
+            self.ent_s_duration,
+            self.ent_s_count,
+            self.chk_s_full,
+            self.chk_s_no_audio,
+            self.cmb_s_srv,
+            self.ent_s_target,
+            self.txt_s_targets_frame,
+        ):
             w.pack_forget()
 
         if mode == "yt":
-            self.lbl_s_target.config(text="URL или .txt файл:")
+            self.lbl_s_target.config(text="Ссылки или .txt файл:")
+            self.txt_s_targets_frame.pack(fill="both", expand=True)
             self.btn_s_browse_file.config(state="normal")
             self.lbl_s_param.config(text="Фрагмент (сек):")
             self.ent_s_duration.pack(side="left", padx=4)
             self.chk_s_full.pack(side="left", padx=10)
+            self.chk_s_no_audio.pack(side="left", padx=(0, 10))
         elif mode in ("pexels", "pixabay"):
             self.lbl_s_target.config(text="Запрос (англ.):")
+            self.ent_s_target.pack(fill="x", expand=True)
             self.btn_s_browse_file.config(state="disabled")
             self.lbl_s_param.config(text="Количество видео:")
             self.ent_s_count.pack(side="left", padx=4)
         else:  # batch-tags
             self.lbl_s_target.config(text="Файл тегов (.txt):")
+            self.ent_s_target.pack(fill="x", expand=True)
             self.btn_s_browse_file.config(state="normal")
             self.lbl_s_param.config(text="Видео на тег / сервис:")
             self.ent_s_count.pack(side="left", padx=4)
@@ -626,7 +653,11 @@ class App(tk.Tk):
     def browse_stock_file(self):
         p = filedialog.askopenfilename(title="Выберите .txt файл", filetypes=[("Text files", "*.txt"), ("All", "*.*")])
         if p:
-            self.s_target.set(p)
+            if self.s_mode.get() == "yt":
+                self.txt_s_targets.delete("1.0", "end")
+                self.txt_s_targets.insert("1.0", p)
+            else:
+                self.s_target.set(p)
 
     def browse_stock_output(self):
         d = filedialog.askdirectory(title="Папка для скачанных видео", initialdir=self.s_output.get() or str(APP_DIR))
@@ -935,19 +966,30 @@ class App(tk.Tk):
     def build_cmd(self, kind, project: Path | None):
         if kind == "stock":
             mode = self.s_mode.get()
-            target = self.s_target.get().strip()
-            if not target:
-                raise ValueError("Укажи ссылку, поисковый запрос или файл.")
             out_dir = self.s_output.get().strip() or str(APP_DIR / "downloads")
-            cmd = self._base_worker_cmd("stock", SCRIPT_STOCK) + [mode, target, "-o", out_dir]
             if mode == "yt":
+                raw = self.txt_s_targets.get("1.0", "end-1c")
+                targets = [
+                    line.strip()
+                    for line in raw.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+                if not targets:
+                    raise ValueError("Укажи ссылку, список ссылок или .txt файл.")
+                cmd = self._base_worker_cmd("stock", SCRIPT_STOCK) + [mode, *targets, "-o", out_dir]
                 dur = self.s_duration.get().strip() or "30"
                 if int(dur) <= 0:
                     raise ValueError("Длительность фрагмента должна быть > 0")
                 cmd += ["-d", dur]
                 if self.s_full.get():
                     cmd.append("--full")
+                if self.s_no_audio.get():
+                    cmd.append("--no-audio")
             else:
+                target = self.s_target.get().strip()
+                if not target:
+                    raise ValueError("Укажи ссылку, поисковый запрос или файл.")
+                cmd = self._base_worker_cmd("stock", SCRIPT_STOCK) + [mode, target, "-o", out_dir]
                 cnt = self.s_count.get().strip() or "3"
                 if int(cnt) <= 0:
                     raise ValueError("Количество видео должно быть > 0")
@@ -999,6 +1041,8 @@ class App(tk.Tk):
                 cmd.append("--skip-overlays")
             if self.t_skip_edges.get():
                 cmd.append("--skip-edges")
+            if self.t_snap_timeline.get():
+                cmd.append("--snap-timeline")
             every_s = self.t_every.get().strip()
             if every_s:
                 every = int(every_s)
@@ -1192,7 +1236,8 @@ class App(tk.Tk):
         self.cfg.update(
             drafts_dir=str(self.drafts_dir), last_project=str(p) if p else "",
             t_dry=self.t_dry.get(), t_skip=self.t_skip.get(),
-            t_skip_edges=self.t_skip_edges.get(), t_every=self.t_every.get(),
+            t_skip_edges=self.t_skip_edges.get(), t_snap_timeline=self.t_snap_timeline.get(),
+            t_every=self.t_every.get(),
             t_chance=self.t_chance.get(), t_min_clip=self.t_min_clip.get(),
             t_seed=self.t_seed.get(),
             c_dry=self.c_dry.get(), c_scale=self.c_scale.get(), c_reset=self.c_reset.get(),
@@ -1203,8 +1248,11 @@ class App(tk.Tk):
             a_subscribe=self.a_subscribe.get(),
             a_prompts=self.a_prompts.get(), a_markers=self.a_markers.get(),
             a_anchor_prompt=self.a_anchor_prompt.get(), a_voice=self.a_voice.get(),
-            s_mode=self.s_mode.get(), s_target=self.s_target.get(), s_count=self.s_count.get(),
+            s_mode=self.s_mode.get(), s_target=self.s_target.get(),
+            s_yt_targets=self.txt_s_targets.get("1.0", "end-1c"),
+            s_count=self.s_count.get(),
             s_duration=self.s_duration.get(), s_full=self.s_full.get(),
+            s_no_audio=self.s_no_audio.get(),
             s_batch_srv=self.s_batch_srv.get(), s_output=self.s_output.get(),
         )
         # параметры, которые теперь заданы в коде и убраны из интерфейса
