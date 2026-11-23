@@ -98,7 +98,7 @@ def test_add_intro_and_ambient_placement_and_fades(tmp_path):
     assert res["ambient"] == {
         "start_us": 6_000_000,
         "duration_us": 14_000_000,
-        "fade_in_us": 3_000_000,
+        "fade_in_us": 0,
         "fade_out_us": 4_000_000,
     }
 
@@ -119,7 +119,7 @@ def test_add_intro_and_ambient_placement_and_fades(tmp_path):
     ambient_fade = next(fades[r] for r in segs[1]["extra_material_refs"] if r in fades)
     assert intro_fade["fade_in_duration"] == 0
     assert intro_fade["fade_out_duration"] == 4_500_000
-    assert ambient_fade["fade_in_duration"] == 3_000_000
+    assert ambient_fade["fade_in_duration"] == 0
     assert ambient_fade["fade_out_duration"] == 4_000_000
 
     # Повторный запуск не должен дублировать сегменты на авто-дорожке
@@ -128,7 +128,7 @@ def test_add_intro_and_ambient_placement_and_fades(tmp_path):
     assert len(auto_tracks[0]["segments"]) == 2
 
 
-def test_intro_is_end_anchored_and_trimmed_from_start(tmp_path):
+def test_intro_is_end_anchored_and_trimmed_from_end(tmp_path):
     draft = _make_sample_draft(video_durations=(10_000_000, 10_000_000))
     intro = tmp_path / "intro.mp3"
     ambient = tmp_path / "ambient.mp3"
@@ -141,15 +141,16 @@ def test_intro_is_end_anchored_and_trimmed_from_start(tmp_path):
             draft, intro, ambient, intro_anchor_us=8_000_000, fade_us=4_000_000
         )
 
-    # Конец интро ровно на 8 c: играет 8 c, берём последние 8 c из доступных 14 c
+    # Конец интро ровно на 8 c: играет с начала (0..8 c), начало не обрезается
     assert res["intro"]["start_us"] == 0
     assert res["intro"]["duration_us"] == 8_000_000
-    assert res["intro"]["source_start_us"] == 6_000_000
+    assert res["intro"]["source_start_us"] == 0
+    assert res["intro"]["source_duration_us"] == 8_000_000
     assert res["ambient"]["start_us"] == 8_000_000
     assert res["ambient"]["duration_us"] == 12_000_000
 
     segs = [t for t in draft["tracks"] if t.get("name") == setup_audio.AUTO_AUDIO_TRACK_NAME][0]["segments"]
-    assert segs[0]["source_timerange"] == {"start": 6_000_000, "duration": 8_000_000}
+    assert segs[0]["source_timerange"] == {"start": 0, "duration": 8_000_000}
 
 
 def test_intro_shorter_than_anchor_is_slowed_down(tmp_path):

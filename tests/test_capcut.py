@@ -753,6 +753,56 @@ class TestStockFetcher(unittest.TestCase):
         self.assertIn("[30-50s]", seen_opts[0]["outtmpl"])
         self.assertIn("[120-140s]", seen_opts[1]["outtmpl"])
 
+    def test_youtube_no_audio_option(self):
+        seen_opts = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                seen_opts.append(opts)
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def download(self, urls):
+                return 0
+
+        fake_yt_dlp = type(sys)("yt_dlp")
+        fake_yt_dlp.YoutubeDL = FakeYDL
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(sys.modules, {"yt_dlp": fake_yt_dlp}):
+                ok = stock_fetcher.download_youtube_url(
+                    "https://youtu.be/abc", Path(td), full=True, no_audio=True
+                )
+        self.assertTrue(ok)
+        self.assertEqual(seen_opts[0]["format"], "bestvideo/best")
+        self.assertNotIn("merge_output_format", seen_opts[0])
+        self.assertEqual(
+            seen_opts[0]["postprocessors"],
+            [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+        )
+        self.assertEqual(seen_opts[0]["postprocessor_args"], {"ffmpeg": ["-an"]})
+
+    def test_parse_youtube_targets_mixed_list_and_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            txt = Path(td) / "links.txt"
+            txt.write_text("# comment\nhttps://youtu.be/from_file\n\n", encoding="utf-8")
+            urls = stock_fetcher.parse_youtube_targets([
+                "https://youtu.be/one, https://youtu.be/two",
+                f'"{txt}"',
+                "https://youtu.be/three",
+            ])
+            self.assertEqual(
+                urls,
+                [
+                    "https://youtu.be/one",
+                    "https://youtu.be/two",
+                    "https://youtu.be/from_file",
+                    "https://youtu.be/three",
+                ],
+            )
+            with self.assertRaises(FileNotFoundError):
+                stock_fetcher.parse_youtube_targets([str(Path(td) / "missing.txt")])
+
     def test_download_file_stream_cleans_part_on_error(self):
         class BrokenResp:
             headers = {"Content-Length": "100"}

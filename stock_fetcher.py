@@ -172,8 +172,42 @@ def http_get_json(url: str, headers: dict | None = None, params: dict | None = N
 # ==========================================
 # Модуль YouTube (через yt-dlp)
 # ==========================================
-def download_youtube_url(url: str, output_dir: Path, duration: int = 30, full: bool = False) -> bool:
-    """Скачивает YouTube-видео (или фрагмент с таймкода)."""
+def parse_youtube_targets(targets: list[str] | str) -> list[str]:
+    """
+    Разбирает список целей для YouTube: отдельные ссылки, многострочный текст
+    (через перевод строки, пробел или запятую) и пути к .txt файлам со ссылками.
+    """
+    items = [targets] if isinstance(targets, str) else list(targets)
+    urls: list[str] = []
+    for raw in items:
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            candidate = stripped.strip('"')
+            path = Path(candidate)
+            if path.is_file():
+                for file_line in path.read_text(encoding="utf-8").splitlines():
+                    u = file_line.strip()
+                    if u and not u.startswith("#"):
+                        urls.append(u)
+                continue
+            if candidate.lower().endswith(".txt") and not re.match(r"^https?://", candidate, re.IGNORECASE):
+                raise FileNotFoundError(f"Файл со ссылками не найден: {candidate}")
+            for token in re.split(r"[\s,]+", stripped):
+                if token and not token.startswith("#"):
+                    urls.append(token)
+    return urls
+
+
+def download_youtube_url(
+    url: str,
+    output_dir: Path,
+    duration: int = 30,
+    full: bool = False,
+    no_audio: bool = False,
+) -> bool:
+    """Скачивает YouTube-видео (или фрагмент с таймкода), опционально без звука."""
     try:
         import yt_dlp
     except ImportError:
@@ -193,14 +227,20 @@ def download_youtube_url(url: str, output_dir: Path, duration: int = 30, full: b
     else:
         outtmpl = str(output_dir / "%(title).60s [%(id)s].%(ext)s")
 
+    fmt = "bestvideo/best" if no_audio else "bestvideo+bestaudio/best"
     ydl_opts = {
         "outtmpl": outtmpl,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
+        "format": fmt,
         "quiet": False,
         "no_warnings": True,
         "windowsfilenames": True,
     }
+    if not no_audio:
+        ydl_opts["merge_output_format"] = "mp4"
+    else:
+        ydl_opts["postprocessors"] = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
+        ydl_opts["postprocessor_args"] = {"ffmpeg": ["-an"]}
+        print("[*] Режим: без звука (только видеодорожка)")
 
     if timestamp is not None and not full:
         print(f"[*] Найден таймкод: t={start_sec}s. Скачиваем фрагмент [{start_sec}s - {end_sec}s] ({duration} сек)")
@@ -392,11 +432,12 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Команды")
 
-    p_yt = subparsers.add_parser("yt", help="Скачать YouTube видео (по ссылке или файлу)")
-    p_yt.add_argument("target", help="Ссылка на видео или путь к .txt файлу со списком ссылок")
+    p_yt = subparsers.add_parser("yt", help="Скачать YouTube видео (по ссылке, списку ссылок или файлу)")
+    p_yt.add_argument("targets", nargs="+", help="Ссылки на видео или путь к .txt файлу со списком ссылок")
     p_yt.add_argument("-d", "--duration", type=int, default=CONFIG.get("default_clip_duration", 30),
                       help="Длительность фрагмента в сек от таймкода (по умолч. 30)")
     p_yt.add_argument("--full", action="store_true", help="Игнорировать таймкод и качать видео целиком")
+    p_yt.add_argument("--no-audio", action="store_true", help="Скачивать видео без звука")
     p_yt.add_argument("-o", "--output", default="downloads/youtube", help="Папка для сохранения")
 
     p_pex = subparsers.add_parser("pexels", help="Поиск и скачивание с Pexels")
@@ -422,29 +463,29 @@ def main():
 
     if args.command == "yt":
         out_path = Path(args.output)
-        target_path = Path(args.target)
-        if target_path.is_file():
-            urls = [
-                line.strip()
-                for line in target_path.read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.startswith("#")
-            ]
-            if not urls:
-                print(f"[!] В файле нет ссылок: {target_path}")
+        try:
+            urls = parse_youtube_targets(args.targets)
+        except FileNotFoundError as exc:
+            print(f"[!] Ошибка: {exc}")
+            sys.exit(1)
+        if not urls:
+            print("[!] Не найдено ни одной ссылки для скачивания.")
+            sys.exit(1)
+        if len(urls) == 1:
+            if not download_youtube_url(
+                urls[0], out_path, duration=args.duration, full=args.full, no_audio=args.no_audio
+            ):
                 sys.exit(1)
-            print(f"[*] Найдено ссылок в файле: {len(urls)}")
+        else:
+            print(f"[*] Найдено ссылок: {len(urls)}")
             ok = 0
             for idx, u in enumerate(urls, 1):
                 print(f"\n--- Ролик {idx}/{len(urls)} ---")
-                if download_youtube_url(u, out_path, duration=args.duration, full=args.full):
+                if download_youtube_url(
+                    u, out_path, duration=args.duration, full=args.full, no_audio=args.no_audio
+                ):
                     ok += 1
             if ok == 0:
-                sys.exit(1)
-        elif args.target.lower().endswith(".txt") and not target_path.exists():
-            print(f"[!] Ошибка: файл со ссылками не найден: {args.target}")
-            sys.exit(1)
-        else:
-            if not download_youtube_url(args.target, out_path, duration=args.duration, full=args.full):
                 sys.exit(1)
     elif args.command == "pexels":
         if not load_config().get("pexels_api_key"):

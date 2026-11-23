@@ -3,13 +3,13 @@
 """
 setup_audio.py — автоматическая настройка аудио и финального Fade Out в проекте CapCut:
   1. Добавляет intro и ambient, громкость -7 дБ для обоих.
-     В начале intro НЕТ Fade In — звук появляется сразу на полной громкости.
+     В начале intro и ambient НЕТ Fade In — добавляется только Fade Out.
      Конец intro выравнивается по кадру видео, в сценарии которого звучит фраза-маркер
      («начнём с…», «начинаем…» и т. п.). Файл промптов кадров — обычный .txt вида
      «[PROMPT #N] <описание кадра> [<фрагмент сценария>]»; номер промпта связывается с
      клипом видео <N>.mp4 на основной дорожке проекта. Хвост intro (последние 6 сек)
-     не используется — там плохой звук.
-     Переход intro → ambient: Fade Out у intro 4.5 сек, Fade In у ambient 3 сек.
+     не используется — там плохой звук; длинное intro не обрезается с начала, а подрезается с конца.
+     Переход intro → ambient: Fade Out у intro 4.5 сек (без Fade In у ambient).
   2. Включает нормализацию звука (materials.loudnesses, -23 LUFS) на дорожке озвучки (по умолчанию 'voice').
   3. Добавляет анимацию Fade Out (4 сек) на последний видеоклип основной дорожки.
   4. Кладёт видео с призывом подписаться верхним слоем (на дорожку выше основной):
@@ -44,12 +44,12 @@ AUTO_AUDIO_TRACK_NAME = "CapCutAutomation Audio"
 FADE_OUT_EFFECT_ID = "6798320902548230669"
 FADE_OUT_FALLBACK_HASH = "c6f05ce62355b537be762550040bfc08"
 
-# Интро: последние 6 сек не используем (плохой звук), переход в ambient — 4.5 / 3 сек.
-# Fade In в начале интро не нужен: звук должен появляться сразу, без «нарастания».
+# Интро: последние 6 сек не используем (плохой звук), Fade Out у intro — 4.5 сек.
+# Fade In на intro и ambient отключён: добавляется только Fade Out.
 INTRO_TAIL_TRIM_US = 6_000_000
 INTRO_FADE_IN_US = 0
 INTRO_FADE_OUT_US = 4_500_000
-AMBIENT_FADE_IN_US = 3_000_000
+AMBIENT_FADE_IN_US = 0
 # Максимальное замедление интро, если оно короче кадра-якоря (0.25 = в 4 раза медленнее).
 MIN_INTRO_SPEED = 0.25
 
@@ -1199,12 +1199,11 @@ def add_intro_and_ambient(
     Добавляет intro и ambient на авто-дорожку.
 
     intro_anchor_us — время, на котором интро должно закончиться (кадр «начнём с…»).
-    Если якорь задан, интро играет так, чтобы его конец совпал с этим кадром:
-    длинное интро подрезается с начала, а короткое замедляется (speed < 1),
-    чтобы растянуться ровно до кадра. Последние intro_tail_trim_us секунд
-    файла intro не используются. В начале intro Fade In по умолчанию отключён
-    (intro_fade_in_us = 0): звук появляется сразу, без «нарастания».
-    Переход: Fade Out у intro, Fade In у ambient.
+    Если якорь задан, интро играет с самого начала (source_start_us = 0) так, чтобы его
+    конец совпал с этим кадром: длинное интро подрезается с конца (начало не обрезается),
+    а короткое замедляется (speed < 1), чтобы растянуться ровно до кадра.
+    Последние intro_tail_trim_us секунд файла intro не используются.
+    Для intro и ambient Fade In по умолчанию отключён (0): добавляется только Fade Out.
     """
     video_dur = get_video_duration_us(data)
     mats = data.setdefault("materials", {})
@@ -1242,8 +1241,8 @@ def add_intro_and_ambient(
 
         if anchor_us is not None:
             if usable_us > anchor_us:
-                # Звук длиннее кадра: отрезаем начало, конец ровно в кадр.
-                source_start_us = usable_us - anchor_us
+                # Звук длиннее кадра: начало не обрезаем, подрезаем конец ровно под кадр.
+                source_start_us = 0
                 source_dur_us = anchor_us
                 seg_dur = anchor_us
             elif usable_us < anchor_us:
@@ -1591,7 +1590,7 @@ def main(argv=None) -> int:
     ap.add_argument("--intro-fade-out", type=float, default=INTRO_FADE_OUT_US / 1_000_000,
                     help="Fade Out intro на переходе в ambient, сек (по умолч. 4.5)")
     ap.add_argument("--ambient-fade-in", type=float, default=AMBIENT_FADE_IN_US / 1_000_000,
-                    help="Fade In ambient после intro, сек (по умолч. 3.0)")
+                    help="Fade In ambient после intro, сек (по умолч. 0 — без нарастания)")
     ap.add_argument("--voice", default="voice", help="Подстрока для поиска дорожки озвучки (по умолч. voice)")
     ap.add_argument("--db", type=float, default=-7.0, help="Громкость intro/ambient в дБ (по умолч. -7.0)")
     ap.add_argument("--fade", type=float, default=4.0, help="Длительность fade-эффектов в сек (по умолч. 4.0)")
