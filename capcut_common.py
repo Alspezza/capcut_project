@@ -150,6 +150,9 @@ def pick_main_track(tracks: list, index: int | None = None) -> tuple[int, dict]:
     return best_idx, video[best_idx]
 
 
+TIMELINES_DIR_NAME = "Timelines"
+
+
 def _matching_backups(backups_dir: Path, path: Path, prefix: str | None = None) -> list[Path]:
     """Возвращает список файлов бэкапов для path без уязвимости к спецсимволам в имени."""
     if not backups_dir.is_dir():
@@ -162,30 +165,72 @@ def _matching_backups(backups_dir: Path, path: Path, prefix: str | None = None) 
     ]
 
 
-def save_draft_with_backup(path: Path, data: dict, prefix: str = "backup", max_backups: int = 5) -> Path:
-    """
-    Сохраняет резервную копию в подпапку .backups (хранит до max_backups последних копий)
-    и атомарно записывает обновлённый JSON в path.
-    """
-    backups_dir = path.parent / ".backups"
-    backups_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    backup = backups_dir / f"{path.stem}.{prefix}_{stamp}{path.suffix}"
-    counter = 1
-    while backup.exists():
-        backup = backups_dir / f"{path.stem}.{prefix}_{stamp}_{counter:02d}{path.suffix}"
-        counter += 1
-    shutil.copyfile(path, backup)
+def _timelines_main_id(timelines: Path) -> str:
+    """Возвращает id основной временной шкалы из Timelines/project.json (если он есть)."""
+    try:
+        meta = json.loads((timelines / "project.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    main_id = meta.get("main_timeline_id")
+    if main_id:
+        return str(main_id)
+    items = meta.get("timelines")
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        return str(items[0].get("id") or "")
+    return ""
 
-    # Ротация старых бэкапов данного типа
-    if max_backups > 0:
-        old = sorted(_matching_backups(backups_dir, path, prefix=prefix), key=lambda p: p.name, reverse=True)
-        for obsolete in old[max_backups:]:
-            try:
-                obsolete.unlink()
-            except OSError:
-                pass
 
+def timeline_mirror_targets(path: Path, data: dict | None = None) -> list[Path]:
+    """
+    Файл-зеркало в <проект>/Timelines/<uuid>/ с тем же именем, что и path.
+
+    В новых версиях CapCut актуальный таймлайн хранится ещё и в
+    <проект>/Timelines/<uuid>/draft_content.json. Если обновить только корневой
+    draft_content.json, при открытии CapCut может загрузить старый таймлайн и
+    перезаписать изменения. Поэтому копия основной временной шкалы обновляется
+    вместе с корневым файлом. Второстепенные таймлайны не трогаем.
+
+    Основная шкала определяется по id загруженного драфта (data["id"]) или по
+    main_timeline_id из Timelines/project.json. Если id определить не удалось,
+    используется единственная подпапка с файлом-зеркалом.
+
+    Если папки Timelines нет (или path уже лежит внутри неё) — возвращает [].
+    """
+    project_dir = path.parent
+    if project_dir.name.lower() == TIMELINES_DIR_NAME.lower():
+        return []
+    timelines = project_dir / TIMELINES_DIR_NAME
+    if not timelines.is_dir():
+        return []
+
+    main_id = str((data or {}).get("id") or "") or _timelines_main_id(timelines)
+    if main_id:
+        target = timelines / main_id / path.name
+        try:
+            if target.is_file() and target.resolve() != path.resolve():
+                return [target]
+        except OSError:
+            pass
+        return []
+
+    # Нет id — обновляем только если в Timelines ровно одна подпапка с таким файлом.
+    targets: list[Path] = []
+    try:
+        subdirs = [d for d in timelines.iterdir() if d.is_dir()]
+    except OSError:
+        return []
+    for sub in subdirs:
+        target = sub / path.name
+        try:
+            if target.is_file() and target.resolve() != path.resolve():
+                targets.append(target)
+        except OSError:
+            continue
+    return targets if len(targets) == 1 else []
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Атомарно записывает JSON в path (через временный файл рядом)."""
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
@@ -196,12 +241,66 @@ def save_draft_with_backup(path: Path, data: dict, prefix: str = "backup", max_b
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _atomic_copy_file(src: Path, dst: Path) -> None:
+    """Атомарно копирует src в dst (через временный файл рядом)."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), suffix=".tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        shutil.copyfile(src, tmp_path)
+        os.replace(tmp_path, dst)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _save_backup_copy(path: Path, prefix: str, max_backups: int = 5) -> Path:
+    """Копирует path в .backups рядом с файлом и ротирует старые копии."""
+    backups_dir = path.parent / ".backups"
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup = backups_dir / f"{path.stem}.{prefix}_{stamp}{path.suffix}"
+    counter = 1
+    while backup.exists():
+        backup = backups_dir / f"{path.stem}.{prefix}_{stamp}_{counter:02d}{path.suffix}"
+        counter += 1
+    shutil.copyfile(path, backup)
+
+    if max_backups > 0:
+        old = sorted(_matching_backups(backups_dir, path, prefix=prefix), key=lambda p: p.name, reverse=True)
+        for obsolete in old[max_backups:]:
+            try:
+                obsolete.unlink()
+            except OSError:
+                pass
+    return backup
+
+
+def save_draft_with_backup(path: Path, data: dict, prefix: str = "backup", max_backups: int = 5) -> Path:
+    """
+    Сохраняет резервную копию в подпапку .backups (хранит до max_backups последних копий)
+    и атомарно записывает обновлённый JSON в path.
+
+    Дополнительно обновляет копии в <проект>/Timelines/<uuid>/draft_content.json,
+    если такие файлы уже есть, — иначе CapCut при открытии может загрузить старый
+    таймлайн и потерять изменения.
+    """
+    backup = _save_backup_copy(path, prefix, max_backups)
+    _atomic_write_json(path, data)
+
+    for target in timeline_mirror_targets(path, data):
+        _save_backup_copy(target, prefix, max_backups)
+        _atomic_write_json(target, data)
     return backup
 
 
 def restore_latest_backup(path: Path) -> Path:
     """
     Восстанавливает самую свежую резервную копию из .backups и возвращает путь к ней.
+    Обновляет и зеркала в <проект>/Timelines/<uuid>/, если они есть.
     """
     backups_dir = path.parent / ".backups"
     if not backups_dir.is_dir():
@@ -215,16 +314,9 @@ def restore_latest_backup(path: Path) -> Path:
         raise DraftError("Резервные копии в .backups не найдены.")
 
     latest = candidates[0]
-    load_draft(latest)  # проверяем, что бэкап валидный JSON
+    restored = load_draft(latest)  # проверяем, что бэкап валидный JSON
 
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    tmp_path = Path(tmp_name)
-    try:
-        os.close(fd)
-        shutil.copyfile(latest, tmp_path)
-        os.replace(tmp_path, path)
-    except Exception:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        raise
+    _atomic_copy_file(latest, path)
+    for target in timeline_mirror_targets(path, restored):
+        _atomic_copy_file(latest, target)
     return latest
